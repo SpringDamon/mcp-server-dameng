@@ -13,10 +13,10 @@
     "cursor",
     "trae"
   ],
-  "homepage": "https://github.com/your-username/mcp-server-dameng#readme",
+  "homepage": "https://github.com/SpringDamon/mcp-server-dameng#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/your-username/mcp-server-dameng.git"
+    "url": "git+https://github.com/SpringDamon/mcp-server-dameng.git"
   },
   "license": "MIT",
   "author": "",

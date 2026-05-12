@@ -106,7 +106,7 @@ npx mcp-server-dameng setup
         "DAMENG_URL": "jdbc:dm://your-host:5236?schema=YOUR_SCHEMA",
         "DAMENG_USER": "your_username",
         "DAMENG_PASSWORD": "your_password",
-        "DAMENG_DRIVER_PATH": "D:/path/to/DmJdbcDriver18.jar"
+        "DAMENG_DRIVER_PATH": "D:\\path\\to\\DmJdbcDriver18.jar"
       }
     }
   }
@@ -117,7 +117,7 @@ npx mcp-server-dameng setup
 
 ```bash
 # 克隆仓库
-git clone https://github.com/your-username/mcp-server-dameng.git
+git clone https://github.com/SpringDamon/mcp-server-dameng.git
 cd mcp-server-dameng
 
 # 安装依赖
