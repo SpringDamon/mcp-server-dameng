@@ -1,0 +1,9 @@
+src/
+tsconfig.json
+generate-docs.mjs
+test-mcp.mjs
+scripts/
+lib/
+node_modules/
+.git/
+.github/

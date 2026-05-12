@@ -1,0 +1,55 @@
+{
+  "name": "mcp-server-dameng",
+  "version": "1.0.0",
+  "description": "达梦数据库 MCP Server - 通过 Model Context Protocol 让 AI 助手直接连接和查询达梦 DM8 数据库",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "dameng",
+    "达梦",
+    "database",
+    "ai",
+    "claude",
+    "cursor",
+    "trae"
+  ],
+  "homepage": "https://github.com/your-username/mcp-server-dameng#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/your-username/mcp-server-dameng.git"
+  },
+  "license": "MIT",
+  "author": "",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-server-dameng": "dist/index.js"
+  },
+  "files": [
+    "dist/",
+    "java/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "setup": "node scripts/setup.cjs",
+    "compile:java": "cd java && javac -cp \"../lib/DmJdbcDriver18.jar\" DamengJdbcBridge.java",
+    "prepublishOnly": "npm run build",
+    "postinstall": "node scripts/postinstall.cjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.8.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

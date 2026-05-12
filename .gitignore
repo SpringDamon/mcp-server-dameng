@@ -1,0 +1,5 @@
+node_modules/
+dist/
+lib/DmJdbcDriver18.jar
+*.log
+.DS_Store
