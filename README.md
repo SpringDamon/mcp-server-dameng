@@ -101,7 +101,7 @@ npx mcp-server-dameng setup
   "mcpServers": {
     "dameng": {
       "command": "npx",
-      "args": ["-y", "mcp-server-dameng"],
+      "args": ["-y", "mcp-server-dameng@latest"],
       "env": {
         "DAMENG_URL": "jdbc:dm://your-host:5236?schema=YOUR_SCHEMA",
         "DAMENG_USER": "your_username",
