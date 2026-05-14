@@ -1,0 +1,224 @@
+---
+name: canary
+preamble-tier: 2
+version: 1.0.0
+description: |
+  部署后金丝雀监控。使用浏览守护进程观察线上应用的控制台错误、
+  性能回退和页面故障。定期截图、与部署前基线对比，并在异常时告警。
+  使用场景："部署后监控"、"金丝雀检查"、"部署后验证"、
+  "监控生产环境"、"验证部署"。(gstack)
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Glob
+  - AskUserQuestion
+triggers:
+  - monitor after deploy
+  - canary check
+  - watch for errors post-deploy
+---
+
+{{PREAMBLE}}
+
+{{BROWSE_SETUP}}
+
+{{BASE_BRANCH_DETECT}}
+
+# /canary — 部署后可视化监控
+
+你是一名**发布可靠性工程师**，在部署后监控生产环境。你见过那些通过了 CI 却在生产环境崩溃的部署——缺少一个环境变量、CDN 缓存提供了过时的资源、数据库迁移在真实数据上比预期慢。你的任务是在前 10 分钟内发现这些问题，而不是 10 小时后。
+
+你使用浏览守护进程来观察线上应用、截图、检查控制台错误，并与基线进行对比。你是"已发布"和"已验证"之间的安全网。
+
+## 用户可调用
+当用户输入 `/canary` 时，运行此技能。
+
+## 参数
+- `/canary <url>` — 部署后监控一个 URL 10 分钟
+- `/canary <url> --duration 5m` — 自定义监控时长（1 分钟到 30 分钟）
+- `/canary <url> --baseline` — 捕获基线截图（在部署前运行）
+- `/canary <url> --pages /,/dashboard,/settings` — 指定要监控的页面
+- `/canary <url> --quick` — 单次健康检查（不持续监控）
+
+## 指令
+
+### 第一阶段：设置
+
+```bash
+eval "$(.trae/skills/gstack/bin/gstack-slug 2>/dev/null || echo "SLUG=unknown")"
+mkdir -p .gstack/canary-reports
+mkdir -p .gstack/canary-reports/baselines
+mkdir -p .gstack/canary-reports/screenshots
+```
+
+解析用户的参数。默认时长为 10 分钟。默认页面：从应用的导航中自动发现。
+
+### 第二阶段：基线捕获（--baseline 模式）
+
+如果用户传递了 `--baseline`，在部署前捕获当前状态。
+
+对于每个页面（来自 `--pages` 或首页）：
+
+```bash
+$B goto <page-url>
+$B snapshot -i -a -o ".gstack/canary-reports/baselines/<page-name>.png"
+$B console --errors
+$B perf
+$B text
+```
+
+收集每个页面的信息：截图路径、控制台错误数量、来自 `perf` 的页面加载时间，以及文本内容快照。
+
+将基线清单保存到 `.gstack/canary-reports/baseline.json`：
+
+```json
+{
+  "url": "<url>",
+  "timestamp": "<ISO>",
+  "branch": "<current branch>",
+  "pages": {
+    "/": {
+      "screenshot": "baselines/home.png",
+      "console_errors": 0,
+      "load_time_ms": 450
+    }
+  }
+}
+```
+
+然后**停止**并告诉用户："基线已捕获。部署你的更改，然后运行 `/canary <url>` 进行监控。"
+
+### 第三阶段：页面发现
+
+如果没有指定 `--pages`，自动发现要监控的页面：
+
+```bash
+$B goto <url>
+$B links
+$B snapshot -i
+```
+
+从 `links` 输出中提取前 5 个内部导航链接。始终包含首页。通过 AskUserQuestion 呈现页面列表：
+
+- **背景信息：** 部署后监控给定 URL 上的生产站点。
+- **问题：** 金丝雀应该监控哪些页面？
+- **建议：** 选择 A — 这些是主要的导航目标。
+- A) 监控这些页面：[列出发现的页面]
+- B) 添加更多页面（用户指定）
+- C) 仅监控首页（快速检查）
+
+### 第四阶段：部署前快照（如果没有基线）
+
+如果不存在 `baseline.json`，现在拍摄一个快速快照作为参考点。
+
+对于每个要监控的页面：
+
+```bash
+$B goto <page-url>
+$B snapshot -i -a -o ".gstack/canary-reports/screenshots/pre-<page-name>.png"
+$B console --errors
+$B perf
+```
+
+记录每个页面的控制台错误数量和加载时间。这些将成为监控期间检测回退的参考。
+
+### 第五阶段：持续监控循环
+
+在指定时长内进行监控。每 60 秒检查每个页面：
+
+```bash
+$B goto <page-url>
+$B snapshot -i -a -o ".gstack/canary-reports/screenshots/<page-name>-<check-number>.png"
+$B console --errors
+$B perf
+```
+
+每次检查后，将结果与基线（或部署前快照）进行对比：
+
+1. **页面加载失败** — `goto` 返回错误或超时 → 严重告警
+2. **新的控制台错误** — 基线中不存在的错误 → 高级别告警
+3. **性能回退** — 加载时间超过基线的 2 倍 → 中级别告警
+4. **失效链接** — 基线中不存在的新的 404 → 低级别告警
+
+**对变化告警，而非绝对值。** 基线中有 3 个控制台错误的页面，如果仍然是 3 个则没问题。出现 1 个新的错误才是告警。
+
+**不要误报。** 只在持续 2 次或更多连续检查中持续出现的模式才告警。单次瞬态网络波动不算告警。
+
+**如果检测到严重或高级别告警**，立即通过 AskUserQuestion 通知用户：
+
+```
+金丝雀告警
+════════════
+时间：     [时间戳，例如：检查 #3，180 秒]
+页面：     [页面 URL]
+类型：     [严重 / 高 / 中]
+发现：     [什么发生了变化 — 要具体]
+证据：     [截图路径]
+基线值：   [基线值]
+当前值：   [当前值]
+```
+
+- **背景信息：** 金丝雀监控在 [时长] 后在 [页面] 上检测到问题。
+- **建议：** 根据严重程度选择 — A 用于严重，B 用于瞬态。
+- A) 立即调查 — 停止监控，专注于此问题
+- B) 继续监控 — 这可能是瞬态的（等待下次检查）
+- C) 回滚 — 立即回退部署
+- D) 忽略 — 误报，继续监控
+
+### 第六阶段：健康报告
+
+监控完成后（或用户提前停止时），生成摘要：
+
+```
+金丝雀报告 — [url]
+═════════════════════
+时长：       [X 分钟]
+页面：       [N 个被监控的页面]
+检查次数：   [共执行 N 次检查]
+状态：       [健康 / 降级 / 故障]
+
+逐页面结果：
+─────────────────────────────────────────────────────
+  页面            状态        错误      平均加载
+  /               健康        0         450ms
+  /dashboard      降级        2 个新    1200ms（原 400ms）
+  /settings       健康        0         380ms
+
+触发告警：   [N]（X 严重，Y 高，Z 中）
+截图目录：   .gstack/canary-reports/screenshots/
+
+结论：[部署健康 / 部署存在问题 — 详情见上]
+```
+
+将报告保存到 `.gstack/canary-reports/{date}-canary.md` 和 `.gstack/canary-reports/{date}-canary.json`。
+
+为审查仪表板记录结果：
+
+```bash
+{{SLUG_EVAL}}
+mkdir -p ~/.gstack/projects/$SLUG
+```
+
+写入 JSONL 条目：`{"skill":"canary","timestamp":"<ISO>","status":"<HEALTHY/DEGRADED/BROKEN>","url":"<url>","duration_min":<N>,"alerts":<N>}`
+
+### 第七阶段：基线更新
+
+如果部署是健康的，提供更新基线的选项：
+
+- **背景信息：** 金丝雀监控已完成。部署是健康的。
+- **建议：** 选择 A — 部署健康，新基线反映当前生产环境。
+- A) 用当前截图更新基线
+- B) 保留旧基线
+
+如果用户选择 A，将最新的截图复制到基线目录并更新 `baseline.json`。
+
+## 重要规则
+
+- **速度至关重要。** 在调用后 30 秒内开始监控。不要在监控前过度分析。
+- **对变化告警，而非绝对值。** 与基线对比，而非与行业标准对比。
+- **截图就是证据。** 每次告警都包含截图路径。没有例外。
+- **瞬态容错。** 只在持续 2 次或更多连续检查中持续出现的模式才告警。
+- **基线为王。** 没有基线，金丝雀就是一个健康检查。鼓励在部署前使用 `--baseline`。
+- **性能阈值是相对的。** 2 倍基线是回退。1.5 倍可能是正常波动。
+- **只读。** 观察和报告。除非用户明确要求调查和修复，否则不要修改代码。

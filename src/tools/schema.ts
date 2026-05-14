@@ -1,5 +1,13 @@
 import { DamengConfig, executeSql } from "../lib/java-bridge.js";
 
+function validateIdentifier(name: string): string {
+  const cleaned = name.replace(/[^a-zA-Z0-9_]/g, "").toUpperCase();
+  if (!cleaned || cleaned.length > 128) {
+    throw new Error(`无效的标识符: ${name}`);
+  }
+  return cleaned;
+}
+
 export const schemaToolSchema = {
   name: "describe_table",
   description: "查看达梦数据库表的列信息（列名、类型、是否为空、默认值、注释）",
@@ -23,8 +31,8 @@ export async function handleSchemaTool(
   config: DamengConfig,
   args: Record<string, unknown>
 ): Promise<{ content: { type: string; text: string }[] }> {
-  const tableName = String(args.tableName).toUpperCase();
-  const schema = args.schema ? String(args.schema).toUpperCase() : null;
+  const tableName = validateIdentifier(String(args.tableName));
+  const schema = args.schema ? validateIdentifier(String(args.schema)) : null;
 
   let sql: string;
   if (schema) {

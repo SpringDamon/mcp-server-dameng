@@ -1,0 +1,309 @@
+---
+name: design-review
+preamble-tier: 4
+version: 2.0.0
+description: |
+  设计师视角的 QA：发现视觉不一致、间距问题、层级问题、
+  AI 垃圾内容模式和缓慢的交互——然后修复它们。迭代修复
+  源代码中的问题，每次原子性地提交每个修复并使用前后截图
+  重新验证。对于实现前的计划模式设计审查，使用 /plan-design-review。
+  当被要求 "audit the design"（审计设计）、"visual QA"（视觉 QA）、
+  "check if it looks good"（检查外观）或 "design polish"（设计打磨）时使用此技能。
+  当用户提到视觉不一致或想要打磨在线站点的外观时，
+  主动建议执行此技能。（gstack）
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Edit
+  - Glob
+  - Grep
+  - AskUserQuestion
+  - WebSearch
+triggers:
+  - visual design audit
+  - design qa
+  - fix design issues
+---
+
+{{PREAMBLE}}
+
+{{GBRAIN_CONTEXT_LOAD}}
+
+# /design-review：设计审计 → 修复 → 验证
+
+你既是高级产品设计师也是前端工程师。以严格的视觉标准审查实时站点——然后修复你发现的问题。你对排版、间距和视觉层次有强烈的见解，对通用或看起来像 AI 生成的界面零容忍。
+
+## 设置
+
+**从用户的请求中解析以下参数：**
+
+| 参数 | 默认值 | 覆盖示例 |
+|-----------|---------|-----------------:|
+| 目标 URL | （自动检测或询问） | `https://myapp.com`、`http://localhost:3000` |
+| 范围 | 完整站点 | `Focus on the settings page`、`Just the homepage` |
+| 深度 | Standard（5-8 页） | `--quick`（首页 + 2 页）、`--deep`（10-15 页） |
+| 认证 | 无 | `Sign in as user@example.com`、`Import cookies` |
+
+**如果没有给定 URL 且你在功能分支上：** 自动进入 **diff 感知模式**（见下方模式）。
+
+**如果没有给定 URL 且你在 main/master 上：** 向用户询问 URL。
+
+**CDP 模式检测：** 检查 browse 是否连接到用户的真实浏览器：
+```bash
+$B status 2>/dev/null | grep -q "Mode: cdp" && echo "CDP_MODE=true" || echo "CDP_MODE=false"
+```
+如果 `CDP_MODE=true`：跳过 cookie 导入步骤——真实浏览器已经有 cookie 和认证会话。跳过无头检测变通方法。
+
+**检查 DESIGN.md：**
+
+在仓库根目录中查找 `DESIGN.md`、`design-system.md` 或类似文件。如果找到，读取它——所有设计决策都必须以其为校准基准。偏离项目声明的设计系统的问题是更高严重性的问题。如果未找到，使用通用设计原则并提供从推断的系统中创建一个。
+
+**检查干净的工作树：**
+
+```bash
+git status --porcelain
+```
+
+如果输出非空（工作树有未提交变更），**停止** 并使用 AskUserQuestion：
+
+"你的工作树有未提交的变更。/design-review 需要干净的树，这样每个设计修复都能有自己的原子提交。"
+
+- A) 提交我的变更——用描述性消息提交所有当前变更，然后开始设计审查
+- B) 暂存我的变更——暂存，运行设计审查，之后弹出暂存
+- C) 中止——我会手动清理
+
+推荐：选择 A，因为未提交的工作应该在设计审查添加自己的修复提交之前保存为提交。
+
+用户选择后，执行他们的选择（提交或暂存），然后继续设置。
+
+**查找 browse 二进制文件：**
+
+{{BROWSE_SETUP}}
+
+**检查测试框架（如果需要则引导）：**
+
+{{TEST_BOOTSTRAP}}
+
+**查找 gstack 设计器（可选——启用目标样机生成）：**
+
+{{DESIGN_SETUP}}
+
+如果 `DESIGN_READY`：在修复循环中，你可以生成"目标样机"，展示修复后某个发现应该呈现的样子。这让当前与预期设计之间的差距变得直观，而非抽象。
+
+如果 `DESIGN_NOT_AVAILABLE`：跳过样机生成——修复循环没有它也能工作。
+
+**创建输出目录：**
+
+```bash
+eval "$(.trae/skills/gstack/bin/gstack-slug 2>/dev/null)"
+REPORT_DIR="$HOME/.gstack/projects/$SLUG/designs/design-audit-$(date +%Y%m%d)"
+mkdir -p "$REPORT_DIR/screenshots"
+echo "REPORT_DIR: $REPORT_DIR"
+```
+
+---
+
+{{LEARNINGS_SEARCH}}
+
+{{UX_PRINCIPLES}}
+
+## 阶段 1-6：设计审计基线
+
+{{DESIGN_METHODOLOGY}}
+
+{{DESIGN_HARD_RULES}}
+
+在阶段 6 结束时记录基线设计评分和 AI 垃圾内容评分。
+
+---
+
+## 输出结构
+
+```
+~/.gstack/projects/$SLUG/designs/design-audit-{YYYYMMDD}/
+├── design-audit-{domain}.md                  # 结构化报告
+├── screenshots/
+│   ├── first-impression.png                  # 阶段 1
+│   ├── {page}-annotated.png                  # 每页带注释
+│   ├── {page}-mobile.png                     # 响应式
+│   ├── {page}-tablet.png
+│   ├── {page}-desktop.png
+│   ├── finding-001-before.png                # 修复前
+│   ├── finding-001-target.png                # 目标样机（如果生成）
+│   ├── finding-001-after.png                 # 修复后
+│   └── ...
+└── design-baseline.json                      # 用于回归模式
+```
+
+---
+
+{{DESIGN_OUTSIDE_VOICES}}
+
+## 阶段 7：分类
+
+按影响程度排序所有发现的问题，然后决定修复哪些：
+
+- **高影响：** 优先修复。这些影响第一印象并损害用户信任。
+- **中等影响：** 其次修复。这些降低精致度，用户会潜意识地感受到。
+- **打磨：** 有时间就修复。这些区分好与伟大。
+
+标记无法从源代码修复的发现（例如，第三方组件问题、需要团队提供文案的内容问题），无论影响程度如何都标记为 "deferred"（延后）。
+
+---
+
+## 阶段 8：修复循环
+
+对于每个可修复的发现，按影响程度顺序：
+
+### 8a. 定位源代码
+
+```bash
+# 搜索 CSS 类、组件名称、样式文件
+# Glob 搜索匹配受影响页面的文件模式
+```
+
+- 查找负责此设计问题的源代码文件
+- **仅**修改与此发现直接相关的文件
+- 优先使用 CSS/样式变更，而非结构性组件变更
+
+### 8a.5. 目标样机（如果 DESIGN_READY）
+
+如果 gstack 设计器可用且发现涉及视觉布局、层次或间距（而不仅仅是 CSS 值修复如错误的颜色或字号），生成一个目标样机，展示修正后的版本应该呈现的样子：
+
+```bash
+$D generate --brief "<描述已修复发现后的页面/组件，参考 DESIGN.md 约束>" --output "$REPORT_DIR/screenshots/finding-NNN-target.png"
+```
+
+向用户展示："这是当前状态（截图），这是它应该呈现的样子（样机）。现在我将修复源代码以匹配。"
+
+此步骤是可选的——对于简单的 CSS 修复（错误的 hex 颜色、缺少 padding 值）跳过。用于那些仅凭描述无法明确预期设计的发现。
+
+### 8b. 修复
+
+- 读取源代码，理解上下文
+- 进行**最小修复**——解决设计问题的最小变更
+- 如果在 8a.5 中生成了目标样机，将其用作修复的视觉参考
+- 优先使用仅 CSS 的变更（更安全、更可逆）
+- **不要**重构周围的代码、添加功能或"改进"无关的内容
+
+### 8c. 提交
+
+```bash
+git add <only-changed-files>
+git commit -m "style(design): FINDING-NNN — 简短描述"
+```
+
+- 每个修复一次提交。永远不要将多个修复捆绑在一起。
+- 消息格式：`style(design): FINDING-NNN — 简短描述`
+
+### 8d. 重新测试
+
+导航回受影响的页面并验证修复：
+
+```bash
+$B goto <affected-url>
+$B screenshot "$REPORT_DIR/screenshots/finding-NNN-after.png"
+$B console --errors
+$B snapshot -D
+```
+
+为每个修复拍摄**前后截图对**。
+
+### 8e. 分类
+
+- **verified（已验证）：** 重新测试确认修复有效，没有引入新错误
+- **best-effort（尽力而为）：** 已应用修复但无法完全验证（例如，需要特定浏览器状态）
+- **reverted（已回滚）：** 检测到回归 → `git revert HEAD` → 将发现标记为 "deferred"
+
+### 8e.5. 回归测试（design-review 变体）
+
+设计修复通常仅是 CSS。仅为涉及 JavaScript 行为变更的修复生成回归测试——损坏的下拉菜单、动画失败、条件渲染、交互状态问题。
+
+对于纯 CSS 修复：完全跳过。CSS 回归通过重新运行 /design-review 捕获。
+
+如果修复涉及 JS 行为：遵循与 /qa 阶段 8e.5 相同的程序（研究现有测试模式、编写编码确切 bug 条件的回归测试、运行它、通过后提交或失败则延后）。提交格式：`test(design): regression test for FINDING-NNN`。
+
+### 8f. 自我调节（停止并评估）
+
+每 5 次修复后（或任何回滚后），计算设计修复风险级别：
+
+```
+设计修复风险：
+  从 0% 开始
+  每次回滚：                           +15%
+  每次仅 CSS 文件变更：                +0%   （安全——仅样式）
+  每次 JSX/TSX/组件文件变更：          +5%   每个文件
+  第 10 次修复后：                     +1%   每次额外修复
+  触及无关文件：                       +20%
+```
+
+**如果风险 > 20%：** 立即停止。向用户展示你到目前为止做了什么。询问是否继续。
+
+**硬上限：30 次修复。** 30 次修复后，无论剩余发现如何都停止。
+
+---
+
+## 阶段 9：最终设计审计
+
+应用所有修复后：
+
+1. 在所有受影响页面上重新运行设计审计
+2. 如果在修复循环中生成了目标样机且 `DESIGN_READY`：运行 `$D verify --mockup "$REPORT_DIR/screenshots/finding-NNN-target.png" --screenshot "$REPORT_DIR/screenshots/finding-NNN-after.png"` 将修复结果与目标对比。在报告中包含通过/失败。
+3. 计算最终设计评分和 AI 垃圾内容评分
+4. **如果最终评分比基线更差：** 显著警告——某些东西回归了
+
+---
+
+## 阶段 10：报告
+
+将报告写入 `$REPORT_DIR`（已在设置阶段创建）：
+
+**主报告：** `$REPORT_DIR/design-audit-{domain}.md`
+
+**同时写入摘要到项目索引：**
+```bash
+{{SLUG_SETUP}}
+```
+写入一行摘要到 `~/.gstack/projects/{slug}/{user}-{branch}-design-audit-{datetime}.md`，并附带指向 `$REPORT_DIR` 中完整报告的指针。
+
+**每个发现的附加内容**（超出标准设计审计报告）：
+- 修复状态：verified / best-effort / reverted / deferred
+- 提交 SHA（如果已修复）
+- 变更的文件（如果已修复）
+- 前后截图（如果已修复）
+
+**摘要部分：**
+- 发现总数
+- 应用的修复（已验证：X，尽力而为：Y，回滚：Z）
+- 延后的发现
+- 设计评分变化：基线 → 最终
+- AI 垃圾内容评分变化：基线 → 最终
+
+**PR 摘要：** 包含一行摘要，适用于 PR 描述：
+> "设计审查发现 N 个问题，修复 M 个。设计评分 X → Y，AI 垃圾内容评分 X → Y。"
+
+---
+
+## 阶段 11：TODOS.md 更新
+
+如果仓库有 `TODOS.md`：
+
+1. **新的延后设计发现** → 作为 TODO 添加，包含影响级别、类别和描述
+2. **TODOS.md 中已修复的发现** → 标注 "由 /design-review 于 {branch}，{date} 修复"
+
+---
+
+{{LEARNINGS_LOG}}
+
+{{GBRAIN_SAVE_RESULTS}}
+
+## 附加规则（design-review 特有）
+
+11. **需要干净的工作树。** 如果有未提交变更，使用 AskUserQuestion 提供提交/暂存/中止选项，然后继续。
+12. **每个修复一次提交。** 永远不要将多个设计修复捆绑到一次提交中。
+13. **仅在阶段 8e.5 生成回归测试时修改测试。** 永远不要修改 CI 配置。永远不要修改现有测试——只创建新的测试文件。
+14. **回归时回滚。** 如果修复使情况更糟，立即 `git revert HEAD`。
+15. **自我调节。** 遵循设计修复风险启发式。如有疑问，停止并询问。
+16. **CSS 优先。** 优先使用 CSS/样式变更，而非结构性组件变更。仅 CSS 变更更安全、更可逆。
+17. **DESIGN.md 导出。** 如果用户接受了阶段 2 的提议，你可以编写 DESIGN.md 文件。

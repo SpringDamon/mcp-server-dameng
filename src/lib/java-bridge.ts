@@ -12,6 +12,7 @@ export interface DamengConfig {
   url: string;
   user: string;
   password: string;
+  schema?: string;
 }
 
 export interface QueryResult {
@@ -51,18 +52,25 @@ export async function executeSql(
 ): Promise<QueryResult> {
   return new Promise((resolve, reject) => {
     const classpath = getClasspath();
+    
+    const javaEnv = { ...process.env };
+    javaEnv.DAMENG_JDBC_URL = config.url;
+    javaEnv.DAMENG_JDBC_USER = config.user;
+    javaEnv.DAMENG_JDBC_PASSWORD = config.password;
+    if (config.schema) {
+      javaEnv.DAMENG_JDBC_SCHEMA = config.schema;
+    }
+    
     const proc = spawn("java", [
       "-Dfile.encoding=UTF-8",
       "-cp",
       classpath,
       "DamengJdbcBridge",
-      config.url,
-      config.user,
-      config.password,
       sql,
       String(limit),
     ], {
       cwd: JAVA_DIR,
+      env: javaEnv,
     });
 
     let stdout = "";
@@ -107,6 +115,10 @@ export async function executeSql(
   });
 }
 
+export async function testConnection(config: DamengConfig): Promise<QueryResult> {
+  return executeSql(config, "SELECT 1 AS TEST", 1);
+}
+
 export function buildConnectionString(host: string, port: number, dbName: string): string {
-  return `jdbc:dm://${host}:${port}?schema=${dbName}`;
+  return `jdbc:dm://${host}:${port}`;
 }

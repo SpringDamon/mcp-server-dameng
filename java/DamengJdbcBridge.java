@@ -4,16 +4,23 @@ import java.util.*;
 public class DamengJdbcBridge {
 
     public static void main(String[] args) {
-        if (args.length < 4) {
-            System.err.println("{\"error\":\"missing arguments: url user password sql [limit]\"}");
+        if (args.length < 2) {
+            System.err.println("{\"error\":\"missing arguments: sql [limit]\"}");
             System.exit(1);
         }
 
-        String url = args[0];
-        String user = args[1];
-        String password = args[2];
-        String sql = args[3];
-        int limit = args.length > 4 ? Integer.parseInt(args[4]) : 200;
+        String url = System.getenv("DAMENG_JDBC_URL");
+        String user = System.getenv("DAMENG_JDBC_USER");
+        String password = System.getenv("DAMENG_JDBC_PASSWORD");
+        String schema = System.getenv("DAMENG_JDBC_SCHEMA");
+        
+        if (url == null || user == null || password == null) {
+            System.err.println("{\"error\":\"missing environment variables: DAMENG_JDBC_URL, DAMENG_JDBC_USER, DAMENG_JDBC_PASSWORD\"}");
+            System.exit(1);
+        }
+
+        String sql = args[0];
+        int limit = args.length > 1 ? Integer.parseInt(args[1]) : 200;
 
         Connection conn = null;
         Statement stmt = null;
@@ -21,6 +28,13 @@ public class DamengJdbcBridge {
         try {
             Class.forName("dm.jdbc.driver.DmDriver");
             conn = DriverManager.getConnection(url, user, password);
+            
+            if (schema != null && !schema.isEmpty()) {
+                try (Statement schemaStmt = conn.createStatement()) {
+                    schemaStmt.execute("SET SCHEMA " + schema);
+                }
+            }
+            
             stmt = conn.createStatement();
             stmt.setQueryTimeout(30);
 

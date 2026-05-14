@@ -1,0 +1,67 @@
+---
+name: gstack-contrib-add-host
+description: |
+  仅限贡献者的技能：为 gstack 的多主机系统创建新的主机配置。
+  不会为最终用户安装。仅可在 gstack 源代码仓库中使用。
+triggers:
+  - add new host
+  - create host config
+  - contribute new agent host
+---
+
+# /gstack-contrib-add-host — 添加新主机
+
+此技能帮助贡献者为 gstack 添加对新的 AI 编码智能体的支持。
+
+## 你将创建的内容
+
+在 `hosts/<name>.ts` 中创建一个 TypeScript 文件，用于定义：
+- 用于检测的 CLI 二进制文件名
+- 技能目录路径（全局 + 本地）
+- 前置元数据转换规则
+- 路径和工具重写
+- 运行时根目录符号链接清单
+
+## 步骤
+
+### 1. 收集主机信息
+
+询问贡献者：
+- 智能体的名称是什么？（例如 "OpenCode"）
+- CLI 二进制文件名是什么？（例如 "opencode"）
+- 全局存储技能的位置在哪里？（例如 "~/.config/opencode/skills/"）
+- 项目中本地存储技能的位置在哪里？（例如 ".opencode/skills/"）
+- 支持哪些前置元数据字段？（name + description 是最小要求）
+- 是否有自己的工具名称？（例如使用 "exec" 而不是 "Bash"）
+
+### 2. 创建配置文件
+
+参考 `hosts/opencode.ts`。使用收集到的信息创建 `hosts/<name>.ts`。
+遵循 `scripts/host-config.ts` 中的 HostConfig 接口定义。
+
+### 3. 在索引中注册
+
+在 `hosts/index.ts` 中添加导入和重新导出。
+
+### 4. 添加到 .gitignore
+
+在 `.gitignore` 中添加 `.<name>/`。
+
+### 5. 生成并验证
+
+```bash
+bun run gen:skill-docs --host <name>
+```
+
+检查：
+- 输出文件存在于 `.<name>/skills/gstack-*/SKILL.md`
+- 没有 `.claude/skills` 路径泄漏
+- 前置元数据格式符合预期
+
+### 6. 运行测试
+
+```bash
+bun test test/gen-skill-docs.test.ts
+```
+
+所有参数化测试会自动包含新主机。

@@ -1,0 +1,478 @@
+---
+name: setup-gbrain
+preamble-tier: 2
+version: 1.0.0
+description: |
+  为编程代理设置 gbrain：安装 CLI、初始化本地 PGLite 或 Supabase 知识库、
+  注册 MCP、捕获每个远程仓库的信任策略。一条命令从零基础到
+  "gbrain 已运行，且此代理可以调用它。"
+  当被要求"设置 gbrain"、"连接 gbrain"、"启动 gbrain"、
+  "安装 gbrain"、"为此机器配置 gbrain"时使用。(gstack)
+triggers:
+  - setup gbrain
+  - install gbrain
+  - connect gbrain
+  - start gbrain
+  - configure gbrain
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Edit
+  - Glob
+  - Grep
+  - AskUserQuestion
+---
+
+{{PREAMBLE}}
+
+# /setup-gbrain — gbrain 编程代理配置
+
+你正在为用户的本地 Mac 设置 gbrain（https://github.com/garrytan/gbrain），一个持久化的
+知识库，以便此编程代理（通常是 Claude Code）可以同时将其作为 CLI 和 MCP 工具调用。
+
+**范围诚实：** 此技能的 MCP 注册步骤（5a）使用 `claude mcp add`，
+专门针对 Claude Code。其他本地宿主（Cursor、Codex CLI 等）仍会在 PATH
+上获得 gbrain CLI——它们可以在设置后手动在自己的 MCP 配置中
+注册 `gbrain serve`。
+
+**目标用户：** 本地 Mac 用户。openclaw/hermes 代理通常运行在云
+Docker 容器中，拥有自己的 gbrain；在它们和本地 Claude Code 之间
+"共享"知识库只能通过共享 Postgres（Supabase）实现。
+
+## 用户调用
+当用户输入 `/setup-gbrain` 时，运行此技能。三种快捷模式：
+
+- `/setup-gbrain` — 完整流程（默认）
+- `/setup-gbrain --repo` — 仅为当前仓库翻转每个远程仓库的策略
+- `/setup-gbrain --switch` — 仅迁移引擎（PGLite ↔ Supabase）
+- `/setup-gbrain --resume-provision <ref>` — 在轮询步骤重新进入之前中断的
+  Supabase 自动配置
+- `/setup-gbrain --cleanup-orphans` — 列出 + 删除进行中的 Supabase 项目
+
+自行解析调用参数——这些是技能的自然语言提示，不是
+作为调度二进制文件实现的。
+
+---
+
+## 第 1 步：检测当前状态
+
+```bash
+.trae/skills/gstack/bin/gstack-gbrain-detect
+```
+
+捕获 JSON 输出。它包含：`gbrain_on_path`、`gbrain_version`、
+`gbrain_config_exists`、`gbrain_engine`、`gbrain_doctor_ok`、
+`gstack_brain_sync_mode`、`gstack_brain_git`。
+
+跳过已经完成的下游步骤。在一行中报告检测到的状态，
+以便用户知道你发现了什么：
+
+> "检测到：gbrain v0.18.2 在 PATH 上，engine=postgres，doctor=ok，
+>  sync=仅制品。无需安装；跳转到策略检查。"
+
+在此处基于 `--repo`、`--switch`、`--resume-provision`、`--cleanup-orphans`
+调用标志进行分支，并跳转到匹配的步骤。
+
+---
+
+## 第 2 步：选择路径（AskUserQuestion）
+
+仅在步骤 1 显示没有现有的工作配置且未传递快捷标志时触发此步骤。问题标题："你的知识库应该在哪里？"
+
+选项（根据检测到的状态呈现）：
+
+- **1 — Supabase，我已有连接字符串。** 云代理用户，其 openclaw/hermes 已
+  配置好一个。从 Supabase 仪表板粘贴会话池化器 URL（Settings → Database → Connection Pooler
+  → Session）。*要在提示中包含的信任面警告：* "粘贴此 URL 会让你的本地 Claude Code 获得对你的云代理能看到的每个页面的完全读写访问权限。如果那不是你想要的信任级别，请选择 PGLite 本地替代，并接受知识库是分离的。"
+- **2a — Supabase，自动配置新项目。** 你需要一个 Supabase 个人访问令牌（约 90 秒）。最适合共享团队知识库。
+- **2b — Supabase，手动创建。** 自行完成 supabase.com 注册流程；准备好后将 URL 粘贴回来。
+- **3 — PGLite 本地。** 零账户，约 30 秒。仅此 Mac 上的隔离知识库。最适合首次尝试。
+- **切换**（仅在步骤 1 检测到现有引擎时）："你已经有 `<engine>` 知识库。迁移到另一个引擎？" → 运行 `gbrain migrate --to <other>`，包装在 `timeout 180s` 中（D9）。
+
+不要静默选择；触发 AskUserQuestion。
+
+---
+
+## 第 3 步：安装 gbrain CLI（如果缺失）
+
+仅在 `gbrain_on_path=false` 时：
+
+```bash
+.trae/skills/gstack/bin/gstack-gbrain-install
+```
+
+安装程序运行 D5 先检测（首先探测 `~/git/gbrain`、`~/gbrain`），
+然后运行 D19 PATH 阴影验证（安装后 `gbrain --version` 必须匹配
+安装目录的 `package.json`）。如果 D19 失败，安装程序以退出码 3 退出，并附带
+清晰的修复菜单；向用户显示完整输出并停止。不要
+继续技能——在用户修复 PATH 之前环境是损坏的。
+
+---
+
+## 第 4 步：初始化知识库
+
+路径特定的。
+
+### 路径 1（Supabase，现有 URL）
+
+源化秘密读取辅助工具，使用 `read -s` + 脱敏预览收集 URL：
+
+```bash
+. .trae/skills/gstack/bin/gstack-gbrain-lib.sh
+read_secret_to_env GBRAIN_POOLER_URL "粘贴会话池化器 URL：" \
+  --echo-redacted 's#://[^@]*@#://***@#'
+```
+
+然后进行结构验证：
+
+```bash
+printf '%s' "$GBRAIN_POOLER_URL" | .trae/skills/gstack/bin/gstack-gbrain-supabase-verify -
+```
+
+如果验证退出码是 3（直接连接 URL），验证器自己的
+消息会解释修复方法；显示它并重新提示输入会话池化器 URL。
+
+成功后，通过环境变量将控制权交给 gbrain（D10，绝不使用 argv）：
+
+```bash
+GBRAIN_DATABASE_URL="$GBRAIN_POOLER_URL" gbrain init --non-interactive --json
+```
+
+然后立即 `unset GBRAIN_POOLER_URL GBRAIN_DATABASE_URL`。URL 现在
+由 gbrain 本身以模式 0600 持久化到 `~/.gbrain/config.json` 中。
+
+### 路径 2a（Supabase，自动配置 — D7）
+
+在收集令牌之前，逐字显示 D11 PAT 范围披露：
+
+> *此 Supabase 个人访问令牌授予对你 Supabase 账户中
+> 每个项目的完全读写/删除访问权限，而不仅仅是我们即将
+> 创建的 `gbrain` 项目。Supabase 当前不支持范围化令牌。我们
+> 仅使用此 PAT 执行以下操作：创建一个项目、轮询直到健康、读取
+> 会话池化器 URL——然后从进程内存中丢弃它。令牌
+> 在 Supabase 端保持有效，直到你在
+> https://supabase.com/dashboard/account/tokens 手动撤销——我们建议在
+> 设置完成后立即撤销。*
+
+然后：
+
+```bash
+. .trae/skills/gstack/bin/gstack-gbrain-lib.sh
+read_secret_to_env SUPABASE_ACCESS_TOKEN "粘贴 PAT："
+```
+
+通过 AskUserQuestion 询问 D17 层级提示："哪个 Supabase 层级？" 展示
+免费（2 个项目限制，7 天不活动后暂停）vs 专业版（$25/月，不
+暂停，推荐实际使用）。解释层级是**组织级别**的（根据
+Management API 合同）——用户根据其当前层级选择组织。专业版可能需要他们先在 supabase.com 升级组织。
+
+列出组织，选择一个（如果有多个则使用 AskUserQuestion）：
+
+```bash
+orgs=$(.trae/skills/gstack/bin/gstack-gbrain-supabase-provision list-orgs --json)
+```
+
+如果 `.orgs` 数组为空，显示："你的 Supabase 账户没有
+组织。在 https://supabase.com/dashboard 创建一个，然后重新运行
+`/setup-gbrain`。" 停止。
+
+向用户询问区域（默认 `us-east-1`；有效值是 Supabase Management API 中的 18
+个枚举值——列出几个常见的，让他们选择"其他"以获取完整列表）。
+
+生成数据库密码（绝不显示给用户）：
+
+```bash
+export DB_PASS=$(openssl rand -base64 24)
+```
+
+设置 SIGINT 陷阱（D12 基本恢复）：
+
+```bash
+trap 'echo ""; echo "gstack-gbrain: 被中断。进行中的引用：$INFLIGHT_REF"; \
+      echo "恢复：/setup-gbrain --resume-provision $INFLIGHT_REF"; \
+      echo "删除：https://supabase.com/dashboard/project/$INFLIGHT_REF"; \
+      unset SUPABASE_ACCESS_TOKEN DB_PASS; exit 130' INT TERM
+```
+
+创建 + 等待 + 获取：
+
+```bash
+result=$(.trae/skills/gstack/bin/gstack-gbrain-supabase-provision \
+  create gbrain "$REGION" "$ORG_SLUG" --json)
+INFLIGHT_REF=$(echo "$result" | jq -r .ref)
+.trae/skills/gstack/bin/gstack-gbrain-supabase-provision wait "$INFLIGHT_REF" --json
+pooler=$(.trae/skills/gstack/bin/gstack-gbrain-supabase-provision \
+  pooler-url "$INFLIGHT_REF" --json)
+GBRAIN_DATABASE_URL=$(echo "$pooler" | jq -r .pooler_url)
+export GBRAIN_DATABASE_URL
+gbrain init --non-interactive --json
+unset SUPABASE_ACCESS_TOKEN DB_PASS GBRAIN_DATABASE_URL INFLIGHT_REF
+trap - INT TERM
+```
+
+成功后，发出 PAT 撤销提醒：
+
+> "设置完成。在
+> https://supabase.com/dashboard/account/tokens 撤销你粘贴的 PAT——我们已从
+> 内存中丢弃它，不再需要它。gbrain 项目将继续
+> 工作，因为它使用自己的嵌入式数据库密码。"
+
+### 路径 2b（Supabase，手动）
+
+引导用户完成 supabase.com 步骤：
+1. 在 https://supabase.com/dashboard 登录
+2. 点击"New Project"，命名为 `gbrain`，选择一个区域，复制生成的
+   数据库密码（你需要它粘贴回来吗？不需要——它嵌入在
+   我们接下来收集的池化器 URL 中）
+3. 等待约 2 分钟让项目初始化
+4. Settings → Database → Connection Pooler → Session → 复制 URL（端口
+   6543）
+
+然后按照与路径 1 相同的秘密读取 + 验证 + 初始化流程。
+
+### 路径 3（PGLite 本地）
+
+```bash
+gbrain init --pglite --json
+```
+
+完成。无需网络，无需密钥。
+
+### 切换（从检测到的现有引擎状态）
+
+```bash
+# 从 PGLite → Supabase，先收集 URL（路径 1 流程），然后：
+timeout 180s gbrain migrate --to supabase --url "$URL" --json
+# 从 Supabase → PGLite：
+timeout 180s gbrain migrate --to pglite --json
+```
+
+如果 `timeout` 返回 124（超时的退出码）：显示 D9 消息
+（"迁移未在 3 分钟内完成——另一个 gstack 会话可能
+正在锁定源知识库。关闭其他工作区并重新运行
+`/setup-gbrain --switch`。你的原始知识库未受影响。"）。停止。
+
+---
+
+## 第 5 步：验证 gbrain doctor
+
+```bash
+doctor=$(gbrain doctor --json)
+status=$(echo "$doctor" | jq -r .status)
+```
+
+如果状态是 `ok` 或 `warnings`，继续。任何其他状态 → 显示完整
+的 doctor 输出并停止。
+
+---
+
+## 第 5a 步：将 gbrain 注册为 Claude Code MCP（D18）
+
+仅在 `which claude` 解析时。询问："给 Claude Code 一个类型化的 gbrain 工具
+表面？（推荐 yes）"
+
+如果是，以**用户范围**使用 gbrain 二进制文件的**绝对路径**注册。
+用户范围使 MCP 在此机器上的每个 Claude Code 会话中可用，
+而不仅是当前工作区。绝对路径避免 Claude Code 将 `gbrain serve` 作为子进程
+生成时的 PATH 解析问题。
+
+```bash
+GBRAIN_BIN=$(command -v gbrain)
+[ -z "$GBRAIN_BIN" ] && GBRAIN_BIN="$HOME/.bun/bin/gbrain"
+claude mcp add --scope user gbrain -- "$GBRAIN_BIN" serve
+claude mcp list | grep gbrain  # 验证：应显示"✓ Connected"
+```
+
+如果用户已经从之前的运行中拥有本地范围注册，
+先移除它以便两个范围不冲突：
+```bash
+claude mcp remove gbrain 2>/dev/null || true
+```
+
+如果 `claude` 不在 PATH 上：发出"MCP 注册已跳过——此技能
+面向 Claude Code；在你的代理的 MCP 配置中手动注册 `gbrain serve`。"
+继续到第 6 步。
+
+**提醒用户：** 已经打开的 Claude Code 会话在重新启动之前不会
+获取新的 MCP 工具。告诉他们："重新启动任何打开的
+Claude Code 会话以查看 `mcp__gbrain__*` 工具——它们在
+会话启动时加载，而不是会话中间。"
+
+---
+
+## 第 6 步：每个远程仓库的策略（D3 三元组，受控的仓库导入）
+
+如果我们在具有 `origin` 远程仓库的 git 仓库中，检查策略：
+
+```bash
+current_tier=$(.trae/skills/gstack/bin/gstack-gbrain-repo-policy get)
+```
+
+分支：
+- `read-write` — 导入此仓库：`gbrain import "$(pwd)" --no-embed` 然后
+  在后台运行 `gbrain embed --stale &`。
+- `read-only` — 完全跳过导入（此层级由未来的
+  自动导入钩子和 gbrain 解析器注入强制执行，不是在这里）。
+- `deny` — 不执行任何操作。
+- `unset` — AskUserQuestion："`<normalized-remote>` 应该如何与
+  gbrain 交互？"
+  - `read-write` — 代理可以从此仓库搜索和写入新页面
+  - `read-only` — 代理可以搜索但绝不写入
+  - `deny` — 完全不交互
+  - `skip-for-now` — 不持久化，下次再问
+
+  回答后（除了 skip-for-now）：
+  ```bash
+  .trae/skills/gstack/bin/gstack-gbrain-repo-policy set "$REMOTE" "$TIER"
+  ```
+  然后仅在 `read-write` 时导入。
+
+如果在 git 仓库之外或没有 origin 远程仓库：跳过此步骤并注明。
+
+对于 `/setup-gbrain --repo` 调用，仅执行第 6 步并退出。
+
+---
+
+## 第 7 步：提供 gstack-brain-sync 并将其接入 gbrain
+
+单独的 AskUserQuestion："也将你的 gstack 会话记忆（学习记录、
+计划、回顾）同步到 gbrain 可以跨机器索引的私有 git 仓库？"
+
+选项：
+- 是，完整同步（所有允许的内容）
+- 是，仅制品（计划、设计、回顾——跳过行为数据）
+- 不用了，谢谢
+
+如果是：
+
+```bash
+.trae/skills/gstack/bin/gstack-brain-init
+.trae/skills/gstack/bin/gstack-config set gbrain_sync_mode artifacts-only
+# 或 "full" 如果用户选择 yes-full
+```
+
+然后将知识库仓库接入 gbrain，以便其内容可从任何
+gbrain 客户端搜索（此 Claude Code 会话、未来的 Mac、可选的云代理）。
+辅助工具创建 `~/.gstack/` 的 `git worktree`，将其注册为
+用户 gbrain（Supabase 或 PGLite）上的联合源，并运行
+初始的 `gbrain sync`。仅限本地 Mac。无需云代理。后续的
+技能运行通过现有的技能端推送钩子触发增量同步。
+
+首先从 `~/.gbrain/config.json` 捕获数据库 URL 并显式传递，
+以便接入对任何可能在同步中间重写
+`~/.gbrain/config.json` 的其他进程具有鲁棒性（例如，机器其他地方的并发 `gbrain init` 运行）：
+
+```bash
+GBRAIN_URL=$(python3 -c "
+import json, os, sys
+try:
+    c = json.load(open(os.path.expanduser('~/.gbrain/config.json')))
+    print(c.get('database_url', ''))
+except Exception:
+    pass
+")
+.trae/skills/gstack/bin/gstack-gbrain-source-wireup --strict \
+  ${GBRAIN_URL:+--database-url "$GBRAIN_URL"}
+```
+
+如果缺少先决条件（未安装 gbrain、< 0.18.0、或尚无
+`~/.gstack/.git`），`--strict` 以非零退出码退出，以便用户看到失败而不是静默
+最终拥有未接入的知识库。如果非零退出，显示辅助工具的
+输出并根据技能规则停止——在修复先决条件之前无法跨机器搜索。
+
+---
+
+## 第 8 步：在 CLAUDE.md 中持久化 `## GBrain 配置`
+
+在 CLAUDE.md 中查找替换（或追加）此部分：
+
+```markdown
+## GBrain 配置（由 /setup-gbrain 配置）
+- 引擎：{pglite|postgres}
+- 配置文件：~/.gbrain/config.json（模式 0600）
+- 设置日期：{today}
+- MCP 已注册：{yes/no}
+- 记忆同步：{off|artifacts-only|full}
+- 当前仓库策略：{read-write|read-only|deny|unset}
+```
+
+---
+
+## 第 9 步：冒烟测试
+
+```bash
+SLUG="setup-gbrain-smoke-test-$(date +%s)"
+echo "设置于 $(date)。/setup-gbrain 的冒烟测试。" | gbrain put "$SLUG"
+gbrain search "smoke test" | grep -i "$SLUG"
+```
+
+确认往返。如果失败，显示 `gbrain doctor --json` 输出
+并以 NEEDS_CONTEXT 升级停止。
+
+---
+
+## `/setup-gbrain --cleanup-orphans`（D20）
+
+重新收集 PAT（步骤 4 路径 2a 范围披露），然后：
+
+```bash
+# 列出用户的 Supabase 项目（用户必须通过自己的
+# shell 传递此输出进行审查；我们不依赖存储的 PAT）。
+export SUPABASE_ACCESS_TOKEN="<从 read_secret_to_env 收集>"
+projects=$(curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  https://api.supabase.com/v1/projects)
+```
+
+解析响应，识别任何名称以 `gbrain` 开头的项目，其
+`ref` 与用户的活跃 `~/.gbrain/config.json` 池化器 URL 不匹配。
+对于每个孤儿，每个项目询问 AskUserQuestion："删除孤儿项目
+`<ref>`（`<name>`，创建于 `<created_at>`）？"——绝不批量处理；每个项目
+确认是单向门。
+
+确认删除后：
+```bash
+curl -s -X DELETE -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+  https://api.supabase.com/v1/projects/$REF
+```
+
+没有第二次明确确认绝不删除活跃知识库。
+
+最后：`unset SUPABASE_ACCESS_TOKEN`。撤销提醒。
+
+---
+
+## 遥测（D4）
+
+前言的遥测块在退出时记录技能成功/失败。在
+发出事件时，将这些枚举的分类值添加到
+遥测负载（安全——没有自由形式的秘密，绝不是 URL 或 PAT）：
+
+- `scenario`：`supabase-existing` | `supabase-auto-provision` |
+  `supabase-manual` | `pglite-local` | `switch-to-supabase` |
+  `switch-to-pglite` | `repo-flip-only` | `cleanup-orphans` |
+  `resume-provision`
+- `install_performed`：`yes` | `no`（D5 重用）| `skipped`（预先存在）
+- `mcp_registered`：`yes` | `no` | `claude-missing`
+- `trust_tier_set`：`read-write` | `read-only` | `deny` |
+  `skip-for-now` | `n/a`（在 git 仓库之外）
+
+绝不将 `SUPABASE_ACCESS_TOKEN`、`DB_PASS`、`GBRAIN_POOLER_URL`、
+`GBRAIN_DATABASE_URL` 或任何 `postgresql://` 子字符串传递给遥测
+调用。`test/skill-validation.test.ts` 中的 CI grep 测试在
+构建时强制执行此操作。
+
+---
+
+## 重要规则
+
+- **每个秘密一条规则。** PAT、DB_PASS、池化器 URL：仅限环境变量，
+  绝不使用 argv，绝不记录，绝不持久化到磁盘。长期持有池化器 URL 的唯一文件
+  是 `~/.gbrain/config.json`，由 gbrain 自己的 `init` 以模式 0600 写入——这是
+  gbrain 的纪律，不是我们的。
+- **停止点是硬性的。** gbrain doctor 不健康、D19 PATH 阴影、D9
+  迁移超时、冒烟测试失败——每个都是停止。不要掩盖问题。
+- **并发运行锁。** 在技能启动时，`mkdir ~/.gstack/.setup-gbrain.lock.d`
+  （原子操作）。如果 mkdir 失败，中止并显示："另一个 `/setup-gbrain` 实例
+  正在运行。等待它完成，或如果你确定它是过期的则 `rm -rf ~/.gstack/.setup-gbrain.lock.d`。"在正常退出和 SIGINT 陷阱中释放。
+- **CLAUDE.md 是审计追踪。** 成功设置后始终在第 8 步更新它。

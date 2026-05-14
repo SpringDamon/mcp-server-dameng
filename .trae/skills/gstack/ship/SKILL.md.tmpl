@@ -1,0 +1,923 @@
+---
+name: ship
+preamble-tier: 4
+version: 1.0.0
+description: |
+  发布工作流：检测并合并基础分支、运行测试、审查差异、递增版本号、
+  更新 CHANGELOG、提交、推送、创建 PR。当被要求 "ship"（发布）、"deploy"（部署）、
+  "push to main"（推送到主分支）、"create a PR"（创建 PR）、"merge and push"（合并并推送），
+  或 "get it deployed"（部署上线）时使用此技能。
+  当用户表示代码已准备好、询问关于部署、想要推送代码或要求创建 PR 时，
+  请主动调用此技能（不要直接推送/创建 PR）。（gstack）
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Edit
+  - Grep
+  - Glob
+  - Agent
+  - AskUserQuestion
+  - WebSearch
+sensitive: true
+triggers:
+  - ship it
+  - create a pr
+  - push to main
+  - deploy this
+---
+
+{{PREAMBLE}}
+
+{{BASE_BRANCH_DETECT}}
+
+{{GBRAIN_CONTEXT_LOAD}}
+
+# Ship：全自动发布工作流
+
+你正在运行 `/ship` 工作流。这是一个**非交互式的、完全自动化的**工作流。不要在每一步都请求确认。用户说了 `/ship` 就意味着"执行它"。一路执行到底，最后输出 PR 的 URL。
+
+**仅在以下情况停止：**
+- 当前在基础分支上（中止）
+- 无法自动解决的合并冲突（停止，展示冲突内容）
+- 分支内的测试失败（预先存在的失败会被分类处理，不会自动阻断）
+- 发布前审查发现需要用户判断的 ASK 类问题
+- 需要 MINOR 或 MAJOR 版本升级时（询问——见步骤 12）
+- Greptile 审查评论需要用户决策（复杂修复、误报）
+- AI 评估的覆盖率低于最低阈值（硬门控，用户可覆盖——见步骤 7）
+- 计划项未完成且无用户覆盖（见步骤 8）
+- 计划验证失败（见步骤 8.1）
+- TODOS.md 缺失且用户想要创建一个（询问——见步骤 14）
+- TODOS.md 组织混乱且用户想要重新组织（询问——见步骤 14）
+
+**永远不会因为以下情况停止：**
+- 未提交的更改（始终包含它们）
+- 版本升级选择（自动选择 MICRO 或 PATCH——见步骤 12）
+- CHANGELOG 内容（从 diff 自动生成）
+- 提交信息确认（自动提交）
+- 多文件变更集（自动拆分为可二分查找的提交）
+- TODOS.md 已完成项检测（自动标记）
+- 可自动修复的审查发现（死代码、N+1、过时注释——自动修复）
+- 在目标阈值内的测试覆盖率缺口（自动生成并提交，或在 PR body 中标记）
+
+**重运行行为（幂等性）：**
+重新运行 `/ship` 意味着"重新执行整个检查清单。"每个验证步骤
+（测试、覆盖率审计、计划完成度、发布前审查、对抗性审查、
+VERSION/CHANGELOG 检查、TODOS、document-release）在每次调用时都会执行。
+只有*操作*是幂等的：
+- 步骤 12：如果 VERSION 已经升级，跳过升级但依然读取版本号
+- 步骤 17：如果已经推送，跳过推送命令
+- 步骤 19：如果 PR 已存在，更新 body 而不是创建新的 PR
+不要因为之前的 `/ship` 运行已经执行过某个验证步骤就跳过它。
+
+---
+
+## 步骤 1：飞行前检查
+
+1. 检查当前分支。如果在基础分支或仓库的默认分支上，**中止**："你在基础分支上。请从功能分支执行 ship。"
+
+2. 运行 `git status`（永远不要使用 `-uall`）。未提交的更改始终会被包含——无需询问。
+
+3. 运行 `git diff <base>...HEAD --stat` 和 `git log <base>..HEAD --oneline` 以了解本次要发布的内容。
+
+4. 检查审查就绪度：
+
+{{REVIEW_DASHBOARD}}
+
+如果工程审查不是 "CLEAR"（通过）：
+
+打印："未找到先前的工程审查——ship 将在步骤 9 中运行自己的发布前审查。"
+
+检查差异大小：`git diff <base>...HEAD --stat | tail -1`。如果 diff 超过 200 行，添加："注意：这是一个大型 diff。考虑在发布前运行 `/plan-eng-review` 或 `/autoplan` 进行架构级审查。"
+
+如果缺少 CEO 审查，作为信息提及（"CEO 审查未运行——对于产品变更建议执行"），但**不阻断**。
+
+对于设计审查：运行 `source <(.trae/skills/gstack/bin/gstack-diff-scope <base> 2>/dev/null)`。如果 `SCOPE_FRONTEND=true` 且仪表板中不存在设计审查（plan-design-review 或 design-review-lite），提及："设计审查未运行——此 PR 更改了前端代码。步骤 9 中将自动运行轻量级设计检查，但考虑运行 /design-review 进行完整的视觉审计。"依然永远不会阻断。
+
+继续到步骤 2——不要阻断或询问。ship 会在步骤 9 中运行自己的审查。
+
+---
+
+## 步骤 2：分发流水线检查
+
+如果 diff 引入了新的独立构件（CLI 二进制文件、库包、工具）——而不是已有部署的 Web
+服务，验证是否存在分发流水线。
+
+1. 检查 diff 是否添加了新的 `cmd/` 目录、`main.go` 或 `bin/` 入口点：
+   ```bash
+   git diff origin/<base> --name-only | grep -E '(cmd/.*/main\.go|bin/|Cargo\.toml|setup\.py|package\.json)' | head -5
+   ```
+
+2. 如果检测到新构件，检查是否存在发布工作流：
+   ```bash
+   ls .github/workflows/ 2>/dev/null | grep -iE 'release|publish|dist'
+   grep -qE 'release|publish|deploy' .gitlab-ci.yml 2>/dev/null && echo "GITLAB_CI_RELEASE"
+   ```
+
+3. **如果不存在发布流水线且添加了新构件：** 使用 AskUserQuestion：
+   - "此 PR 添加了新的二进制/工具，但没有 CI/CD 流水线来构建和发布它。
+     用户合并后将无法下载该构件。"
+   - A) 现在添加发布工作流（CI/CD 发布流水线——GitHub Actions 或 GitLab CI，取决于平台）
+   - B) 延后——添加到 TODOS.md
+   - C) 不需要——这是内部的/仅 Web，已有部署已覆盖
+
+4. **如果发布流水线已存在：** 静默继续。
+5. **如果未检测到新构件：** 静默跳过。
+
+---
+
+## 步骤 3：合并基础分支（在测试之前）
+
+拉取并合并基础分支到功能分支，以便在合并状态下运行测试：
+
+```bash
+git fetch origin <base> && git merge origin/<base> --no-edit
+```
+
+**如果有合并冲突：** 如果是简单冲突（VERSION、schema.rb、CHANGELOG 排序），尝试自动解决。如果冲突复杂或模糊，**停止**并展示它们。
+
+**如果已经是最新：** 静默继续。
+
+---
+
+## 步骤 4：测试框架引导
+
+{{TEST_BOOTSTRAP}}
+
+---
+
+## 步骤 5：运行测试（在合并后的代码上）
+
+**不要运行 `RAILS_ENV=test bin/rails db:migrate`**——`bin/test-lane` 内部已经调用了
+`db:test:prepare`，它会将 schema 加载到正确的 lane 数据库中。
+不带 INSTANCE 直接运行测试迁移会命中孤立的数据库并损坏 structure.sql。
+
+并行运行两个测试套件：
+
+```bash
+bin/test-lane 2>&1 | tee /tmp/ship_tests.txt &
+npm run test 2>&1 | tee /tmp/ship_vitest.txt &
+wait
+```
+
+两者都完成后，读取输出文件并检查通过/失败情况。
+
+**如果有任何测试失败：** 不要立即停止。应用测试失败分类策略：
+
+{{TEST_FAILURE_TRIAGE}}
+
+**分类后：** 如果分支内的失败仍有未修复的，**停止**。不要继续。如果所有失败都是预先存在的且已处理（修复、TODO、分配或跳过），继续到步骤 6。
+
+**如果全部通过：** 静默继续——只需简要说明数量。
+
+---
+
+## 步骤 6：评估套件（条件性）
+
+当 prompt 相关文件发生变更时，评估是强制性的。如果 diff 中没有 prompt 文件，完全跳过此步骤。
+
+**1. 检查 diff 是否涉及 prompt 相关文件：**
+
+```bash
+git diff origin/<base> --name-only
+```
+
+匹配以下模式（来自 CLAUDE.md）：
+- `app/services/*_prompt_builder.rb`
+- `app/services/*_generation_service.rb`、`*_writer_service.rb`、`*_designer_service.rb`
+- `app/services/*_evaluator.rb`、`*_scorer.rb`、`*_classifier_service.rb`、`*_analyzer.rb`
+- `app/services/concerns/*voice*.rb`、`*writing*.rb`、`*prompt*.rb`、`*token*.rb`
+- `app/services/chat_tools/*.rb`、`app/services/x_thread_tools/*.rb`
+- `config/system_prompts/*.txt`
+- `test/evals/**/*`（评估基础设施变更影响所有套件）
+
+**如果没有匹配：** 打印 "No prompt-related files changed — skipping evals."（没有 prompt 相关文件变更——跳过评估），继续到步骤 9。
+
+**2. 识别受影响的评估套件：**
+
+每个评估运行器（`test/evals/*_eval_runner.rb`）都声明了 `PROMPT_SOURCE_FILES`，列出哪些源文件会影响它。用 grep 查找哪些套件与变更文件匹配：
+
+```bash
+grep -l "changed_file_basename" test/evals/*_eval_runner.rb
+```
+
+映射运行器→测试文件：`post_generation_eval_runner.rb` → `post_generation_eval_test.rb`。
+
+**特殊情况：**
+- 变更 `test/evals/judges/*.rb`、`test/evals/support/*.rb` 或 `test/evals/fixtures/` 会影响所有使用这些 judges/support 文件的套件。检查评估测试文件中的导入来确定哪些。
+- 变更 `config/system_prompts/*.txt`——在评估运行器中 grep prompt 文件名以找出受影响的套件。
+- 如果不确定哪些套件受影响，运行所有可能受影响的套件。过度测试比遗漏回归更好。
+
+**3. 以 `EVAL_JUDGE_TIER=full` 运行受影响的套件：**
+
+`/ship` 是合并前门控，所以始终使用 full 级别（Sonnet 结构 + Opus 人格评估器）。
+
+```bash
+EVAL_JUDGE_TIER=full EVAL_VERBOSE=1 bin/test-lane --eval test/evals/<suite>_eval_test.rb 2>&1 | tee /tmp/ship_evals.txt
+```
+
+如果需要运行多个套件，按顺序运行（每个都需要一个测试 lane）。如果第一个套件失败，立即停止——不要在剩余套件上浪费 API 成本。
+
+**4. 检查结果：**
+
+- **如果任何评估失败：** 展示失败、成本仪表板，并**停止**。不要继续。
+- **如果全部通过：** 记录通过数量和成本。继续到步骤 9。
+
+**5. 保存评估输出**——将评估结果和成本仪表板包含在 PR body 中（步骤 19）。
+
+**级别参考（供上下文参考——/ship 始终使用 `full`）：**
+| 级别 | 使用时机 | 速度（缓存后） | 成本 |
+|------|------|----------------|------|
+| `fast`（Haiku） | 开发迭代、冒烟测试 | ~5 秒（快 14 倍） | ~$0.07/次 |
+| `standard`（Sonnet） | 默认开发、`bin/test-lane --eval` | ~17 秒（快 4 倍） | ~$0.37/次 |
+| `full`（Opus 人格） | **`/ship` 和合并前** | ~72 秒（基准） | ~$1.27/次 |
+
+---
+
+## 步骤 7：测试覆盖率审计
+
+**将此步骤作为子代理分派**，使用 Agent 工具并设置 `subagent_type: "general-purpose"`。子代理在干净的上下文窗口中运行覆盖率审计——父代理只看到结论，不看到中间文件读取。这是防御上下文腐化的策略。
+
+**子代理提示：** 将以下指令传递给子代理，将 `<base>` 替换为基础分支：
+
+> 你正在运行 ship 工作流的测试覆盖率审计。根据需要运行 `git diff <base>...HEAD`。不要提交或推送——仅报告。
+>
+> {{TEST_COVERAGE_AUDIT_SHIP}}
+>
+> 分析完成后，在响应的**最后一行**输出一个 JSON 对象（之后不要有其他文本）：
+> `{"coverage_pct":N,"gaps":N,"diagram":"<完整的 Markdown 覆盖率图表，用于 PR body>","tests_added":["path",...]}`
+
+**父代理处理：**
+
+1. 读取子代理的最终输出。将最后一行解析为 JSON。
+2. 存储 `coverage_pct`（用于步骤 20 的指标）、`gaps`（用户摘要）、`tests_added`（用于提交）。
+3. 将 `diagram` 原样嵌入 PR body 的 `## Test Coverage` 部分（步骤 19）。
+4. 打印一行摘要：`覆盖率：{coverage_pct}%，{gaps} 个缺口。已添加 {tests_added.length} 个测试。`
+
+**如果子代理失败、超时或返回无效 JSON：** 回退到在父代理中内联运行审计。不要因为子代理失败而阻断 /ship——部分结果总比没有好。
+
+---
+
+## 步骤 8：计划完成度审计
+
+**将此步骤作为子代理分派**，使用 Agent 工具并设置 `subagent_type: "general-purpose"`。子代理在独立的干净上下文中读取计划文件和每个引用的代码文件。父代理只得到结论。
+
+**子代理提示：** 将以下指令传递给子代理：
+
+> 你正在运行 ship 工作流的计划完成度审计。基础分支是 `<base>`。使用 `git diff <base>...HEAD` 查看发布的内容。不要提交或推送——仅报告。
+>
+> {{PLAN_COMPLETION_AUDIT_SHIP}}
+>
+> 分析完成后，在响应的**最后一行**输出一个 JSON 对象（之后不要有其他文本）：
+> `{"total_items":N,"done":N,"changed":N,"deferred":N,"summary":"<用于 PR body 的 Markdown 检查清单>"}`
+
+**父代理处理：**
+
+1. 将子代理输出的最后一行解析为 JSON。
+2. 存储 `done`、`deferred` 用于步骤 20 的指标；在 PR body 中使用 `summary`。
+3. 如果 `deferred > 0` 且没有用户覆盖，在继续之前通过 AskUserQuestion 展示延后项。
+4. 将 `summary` 嵌入 PR body 的 `## Plan Completion` 部分（步骤 19）。
+
+**如果子代理失败或返回无效 JSON：** 回退到内联运行审计。永远不要因为子代理失败而阻断 /ship。
+
+---
+
+{{PLAN_VERIFICATION_EXEC}}
+
+{{LEARNINGS_SEARCH}}
+
+{{SCOPE_DRIFT}}
+
+---
+
+## 步骤 9：发布前审查
+
+审查 diff，找出测试无法捕获的结构性问题。
+
+1. 读取 `.claude/skills/review/checklist.md`。如果文件无法读取，**停止**并报告错误。
+
+2. 运行 `git diff origin/<base>` 获取完整 diff（针对新拉取的基础分支，限定在功能变更范围内）。
+
+3. 分两遍应用审查清单：
+   - **第一遍（CRITICAL，关键）：** SQL 与数据安全、LLM 输出信任边界
+   - **第二遍（INFORMATIONAL，信息性）：** 所有剩余类别
+
+{{CONFIDENCE_CALIBRATION}}
+
+{{DESIGN_REVIEW_LITE}}
+
+   将设计发现与代码审查发现一起包含。它们遵循相同的"先修复"流程。
+
+{{REVIEW_ARMY}}
+
+{{CROSS_REVIEW_DEDUP}}
+
+4. **将 checklist 审查和专业审查（步骤 9.1-步骤 9.2）的每个发现分类为 AUTO-FIX（自动修复）或 ASK（询问）**，依据 checklist.md 中的"先修复"启发式规则。关键发现倾向于 ASK；信息性发现倾向于 AUTO-FIX。
+
+5. **自动修复所有 AUTO-FIX 项。** 应用每个修复。每行输出一条修复记录：
+   `[AUTO-FIXED] [文件:行号] 问题 → 你做了什么`
+
+6. **如果仍有 ASK 项，** 在一个 AskUserQuestion 中展示：
+   - 列出每个项的编号、严重性、问题、推荐修复
+   - 每项的选项：A) 修复  B) 跳过
+   - 整体推荐
+   - 如果 ASK 项不超过 3 个，可以使用单独的 AskUserQuestion 调用
+
+7. **所有修复完成后（自动 + 用户批准）：**
+   - 如果应用了**任何**修复：按名称提交已修复文件（`git add <fixed-files> && git commit -m "fix: pre-landing review fixes"`），然后**停止**并告诉用户再次运行 `/ship` 以重新测试。
+   - 如果没有应用修复（所有 ASK 项被跳过，或没有发现问题）：继续到步骤 12。
+
+8. 输出摘要：`发布前审查：N 个问题——M 个自动修复，K 个询问（J 个已修复，L 个跳过）`
+
+   如果没有发现问题：`发布前审查：未发现问题。`
+
+9. 将审查结果持久化到审查日志：
+```bash
+.trae/skills/gstack/bin/gstack-review-log '{"skill":"review","timestamp":"TIMESTAMP","status":"STATUS","issues_found":N,"critical":N,"informational":N,"quality_score":SCORE,"specialists":SPECIALISTS_JSON,"findings":FINDINGS_JSON,"commit":"'"$(git rev-parse --short HEAD)"'","via":"ship"}'
+```
+将 TIMESTAMP 替换为 ISO 8601 格式，STATUS 替换为 "clean"（无问题）或 "issues_found"（发现问题），
+N 值来自上述摘要计数。`via:"ship"` 用于区分独立的 `/review` 运行。
+- `quality_score` = 步骤 9.2 中计算的 PR 质量分数（例如 7.5）。如果跳过了专业审查（小型 diff），使用 `10.0`
+- `specialists` = 步骤 9.2 中编译的每个专业审查统计对象。每个被考虑的专业审查都有一个条目：如果分派了则 `{"dispatched":true/false,"findings":N,"critical":N,"informational":N}`，如果跳过了则 `{"dispatched":false,"reason":"scope|gated"}`。示例：`{"testing":{"dispatched":true,"findings":2,"critical":0,"informational":2},"security":{"dispatched":false,"reason":"scope"}}`
+- `findings` = 每个发现的记录数组。对于每个发现（来自 checklist 审查和专业审查），包含：`{"fingerprint":"path:line:category","severity":"CRITICAL|INFORMATIONAL","action":"ACTION"}`。ACTION 为 `"auto-fixed"`（自动修复）、`"fixed"`（用户批准）或 `"skipped"`（用户选择跳过）。
+
+保存审查输出——它将在步骤 19 中放入 PR body。
+
+---
+
+## 步骤 10：处理 Greptile 审查评论（如果 PR 已存在）
+
+**将获取和分类作为子代理分派**，使用 Agent 工具并设置 `subagent_type: "general-purpose"`。子代理拉取每条 Greptile 评论，运行升级检测算法，并对每条评论进行分类。父代理接收结构化列表并处理用户交互和文件编辑。
+
+**子代理提示：**
+
+> 你正在为 /ship 工作流分类 Greptile 审查评论。读取 `.claude/skills/review/greptile-triage.md` 并遵循获取、过滤、分类和**升级检测**步骤。不要修复代码，不要回复评论，不要提交——仅报告。
+>
+> 对每条评论，分配：`classification`（`valid_actionable`、`already_fixed`、`false_positive`、`suppressed`）、`escalation_tier`（1 或 2）、file:line 或 [top-level] 标签、body 摘要和永久链接 URL。
+>
+> 如果不存在 PR、`gh` 失败、API 错误或零评论，输出：`{"total":0,"comments":[]}` 并停止。
+>
+> 否则，在响应的**最后一行**输出一个 JSON 对象：
+> `{"total":N,"comments":[{"classification":"...","escalation_tier":N,"ref":"file:line","summary":"...","permalink":"url"},...]}`
+
+**父代理处理：**
+
+将最后一行解析为 JSON。
+
+如果 `total` 为 0，静默跳过此步骤。继续到步骤 12。
+
+否则，打印：`+ {total} 条 Greptile 评论（{valid_actionable} 条有效，{already_fixed} 条已修复，{false_positive} 条误报）`。
+
+对于 `comments` 中的每条评论：
+
+**有效且可执行（VALID & ACTIONABLE）：** 使用 AskUserQuestion，包含：
+- 评论（file:line 或 [top-level] + body 摘要 + 永久链接 URL）
+- `推荐：选择 A，因为 [一行原因]`
+- 选项：A) 现在修复，B) 确认并直接发布，C) 这是误报
+- 如果用户选择 A：应用修复，提交已修复文件（`git add <fixed-files> && git commit -m "fix: address Greptile review — <简述>"`），使用 greptile-triage.md 中的**Fix 回复模板**回复（包含内联 diff + 解释），并保存到项目级和全局 greptile-history（type: fix）。
+- 如果用户选择 C：使用 greptile-triage.md 中的**False Positive 回复模板**回复（包含证据 + 建议的重新排名），保存到项目级和全局 greptile-history（type: fp）。
+
+**有效但已修复（VALID BUT ALREADY FIXED）：** 使用 greptile-triage.md 中的**Already Fixed 回复模板**回复——不需要 AskUserQuestion：
+- 包含做了什么和修复提交的 SHA
+- 保存到项目级和全局 greptile-history（type: already-fixed）
+
+**误报（FALSE POSITIVE）：** 使用 AskUserQuestion：
+- 展示评论以及为什么认为是误报（file:line 或 [top-level] + body 摘要 + 永久链接 URL）
+- 选项：
+  - A) 回复 Greptile 解释这是误报（如果明显错误，推荐此选项）
+  - B) 不管怎样修复它（如果很简单）
+  - C) 静默忽略
+- 如果用户选择 A：使用 greptile-triage.md 中的**False Positive 回复模板**回复（包含证据 + 建议的重新排名），保存到项目级和全局 greptile-history（type: fp）
+
+**已抑制（SUPPRESSED）：** 静默跳过——这些是先前分类中已知的误报。
+
+**所有评论处理完毕后：** 如果应用了任何修复，步骤 5 的测试现在已过时。在继续到步骤 12 之前**重新运行测试**（步骤 5）。如果没有应用修复，继续到步骤 12。
+
+---
+
+{{ADVERSARIAL_STEP}}
+
+{{LEARNINGS_LOG}}
+
+{{GBRAIN_SAVE_RESULTS}}
+
+## 步骤 12：版本升级（自动决策）
+
+**幂等性检查：** 在升级之前，通过比较 `VERSION` 与基础分支**以及** `package.json` 的 `version` 字段来分类状态。四种状态：FRESH（执行升级）、ALREADY_BUMPED（跳过升级）、DRIFT_STALE_PKG（仅同步 pkg，不重新升级）、DRIFT_UNEXPECTED（停止并询问）。
+
+```bash
+BASE_VERSION=$(git show origin/<base>:VERSION 2>/dev/null | tr -d '\r\n[:space:]' || echo "0.0.0.0")
+CURRENT_VERSION=$(cat VERSION 2>/dev/null | tr -d '\r\n[:space:]' || echo "0.0.0.0")
+[ -z "$BASE_VERSION" ] && BASE_VERSION="0.0.0.0"
+[ -z "$CURRENT_VERSION" ] && CURRENT_VERSION="0.0.0.0"
+PKG_VERSION=""
+PKG_EXISTS=0
+if [ -f package.json ]; then
+  PKG_EXISTS=1
+  if command -v node >/dev/null 2>&1; then
+    PKG_VERSION=$(node -e 'const p=require("./package.json");process.stdout.write(p.version||"")' 2>/dev/null)
+    PARSE_EXIT=$?
+  elif command -v bun >/dev/null 2>&1; then
+    PKG_VERSION=$(bun -e 'const p=require("./package.json");process.stdout.write(p.version||"")' 2>/dev/null)
+    PARSE_EXIT=$?
+  else
+    echo "ERROR: package.json exists but neither node nor bun is available. Install one and re-run."
+    exit 1
+  fi
+  if [ "$PARSE_EXIT" != "0" ]; then
+    echo "ERROR: package.json is not valid JSON. Fix the file before re-running /ship."
+    exit 1
+  fi
+fi
+echo "BASE: $BASE_VERSION  VERSION: $CURRENT_VERSION  package.json: ${PKG_VERSION:-<none>}"
+
+if [ "$CURRENT_VERSION" = "$BASE_VERSION" ]; then
+  if [ "$PKG_EXISTS" = "1" ] && [ -n "$PKG_VERSION" ] && [ "$PKG_VERSION" != "$CURRENT_VERSION" ]; then
+    echo "STATE: DRIFT_UNEXPECTED"
+    echo "package.json version ($PKG_VERSION) disagrees with VERSION ($CURRENT_VERSION) while VERSION matches base."
+    echo "This looks like a manual edit to package.json bypassing /ship. Reconcile manually, then re-run."
+    exit 1
+  fi
+  echo "STATE: FRESH"
+else
+  if [ "$PKG_EXISTS" = "1" ] && [ -n "$PKG_VERSION" ] && [ "$PKG_VERSION" != "$CURRENT_VERSION" ]; then
+    echo "STATE: DRIFT_STALE_PKG"
+  else
+    echo "STATE: ALREADY_BUMPED"
+  fi
+fi
+```
+
+读取 `STATE:` 行并分派：
+
+- **FRESH** → 执行下面的升级操作（步骤 1-4）。
+- **ALREADY_BUMPED** → 默认跳过升级，但首先检查队列漂移：用推导出的升级级别（根据 `CURRENT_VERSION` 与 `BASE_VERSION`）调用 `bin/gstack-next-version`，将其 `.version` 与 `CURRENT_VERSION` 比较。如果不同（自上次 ship 后队列移动了），使用 **AskUserQuestion**："检测到 VERSION 漂移：你声明 v<CURRENT> 但下一个可用版本是 v<NEW>（队列移动了）。A) 重新升级到 v<NEW> 并重写 CHANGELOG 标题 + PR 标题（推荐），B) 保持 v<CURRENT>——在解决之前会被 CI 版本门控拒绝。"如果选择 A，将其视为 FRESH 并使用 `NEW_VERSION=<new>` 运行步骤 1-4（这也将触发步骤 13 的 CHANGELOG 标题重写和步骤 19 的 PR 标题重写）。如果选择 B，重用 `CURRENT_VERSION` 并警告 CI 可能会拒绝。如果工具离线，警告并重用 `CURRENT_VERSION`。
+- **DRIFT_STALE_PKG** → 之前的 `/ship` 升级了 `VERSION` 但未能更新 `package.json`。运行下面的仅同步修复块（步骤 4 之后）。**不要**重新升级。在 CHANGELOG 和 PR body 中重用 `CURRENT_VERSION`。（队列检查仍以 ALREADY_BUMPED 方式运行。）
+- **DRIFT_UNEXPECTED** → `/ship` 已暂停（exit 1）。手动解决；/ship 无法判断哪个文件是权威的。
+
+1. 读取当前的 `VERSION` 文件（4 位格式：`MAJOR.MINOR.PATCH.MICRO`）
+
+2. **根据 diff 自动决定升级级别：**
+   - 统计变更行数（`git diff origin/<base>...HEAD --stat | tail -1`）
+   - 检查功能信号：新的路由/页面文件（如 `app/*/page.tsx`、`pages/*.ts`）、新的数据库迁移/schema 文件、新的测试文件与新的源文件一起出现，或分支名以 `feat/` 开头
+   - **MICRO**（第 4 位）：变更少于 50 行，小改动、拼写错误、配置
+   - **PATCH**（第 3 位）：变更 50+ 行，未检测到功能信号
+   - **MINOR**（第 2 位）：**询问用户**如果检测到**任何**功能信号，或变更 500+ 行，或添加了新模块/包
+   - **MAJOR**（第 1 位）：**询问用户**——仅用于里程碑或破坏性变更
+
+   将选择的级别保存为 `BUMP_LEVEL`（`major`、`minor`、`patch`、`micro` 之一）。这是用户意图的级别。下一步决定*放置*——即使队列感知分配必须跳过已声明的槽位，级别也保持不变。
+
+3. **队列感知版本选择（工作空间感知 ship，v1.6.4.0+）。** 调用 `bin/gstack-next-version` 查看已被开放 PR + 活跃兄弟 Conductor 工作树声明的版本，然后向用户渲染队列状态：
+
+   ```bash
+   QUEUE_JSON=$(bun run bin/gstack-next-version \
+     --base <base> \
+     --bump "$BUMP_LEVEL" \
+     --current-version "$BASE_VERSION" 2>/dev/null || echo '{"offline":true}')
+   NEW_VERSION=$(echo "$QUEUE_JSON" | jq -r '.version // empty')
+   CLAIMED_COUNT=$(echo "$QUEUE_JSON" | jq -r '.claimed | length')
+   ACTIVE_SIBLING_COUNT=$(echo "$QUEUE_JSON" | jq -r '.active_siblings | length')
+   OFFLINE=$(echo "$QUEUE_JSON" | jq -r '.offline // false')
+   REASON=$(echo "$QUEUE_JSON" | jq -r '.reason // ""')
+   ```
+
+   - 如果 `OFFLINE=true` 或工具失败（认证过期、无 `gh`/`glab`、网络问题）：回退到本地 `BUMP_LEVEL` 算术（在选择的级别上升级 `BASE_VERSION`）。打印 `⚠ workspace-aware ship offline — using local bump only`。继续。
+   - 如果 `CLAIMED_COUNT > 0`：向用户渲染队列表，让他们一眼看到发布顺序：
+     ```
+     <base> 上的队列（vBASE_VERSION）：
+       #<pr> <branch> → v<version>   [⚠ 与 #<other> 冲突]
+     活跃兄弟工作空间（WIP，尚未 PR）：
+       <path> → v<version>（Nh 前提交）
+     你的分支将声明：vNEW_VERSION  （<reason>）
+     ```
+   - 如果 `ACTIVE_SIBLING_COUNT > 0` 且任何活跃兄弟的 VERSION `>= NEW_VERSION`，使用 **AskUserQuestion**："兄弟工作空间 <path> 有 v<X> 于 <N> 小时前提交但尚未 PR。等待他们先发布，还是跳过？A) 跳过（推荐用于不相关的工作），B) 中止 /ship 并先与兄弟同步。"
+   - 验证 `NEW_VERSION` 匹配 `MAJOR.MINOR.PATCH.MICRO`。如果工具返回空或格式错误的版本，回退到本地升级。
+
+4. **验证** `NEW_VERSION` 并写入 **`VERSION` 和 `package.json`**。此块仅在 `STATE: FRESH` 时运行。
+
+```bash
+if ! printf '%s' "$NEW_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+  echo "ERROR: NEW_VERSION ($NEW_VERSION) does not match MAJOR.MINOR.PATCH.MICRO pattern. Aborting."
+  exit 1
+fi
+echo "$NEW_VERSION" > VERSION
+if [ -f package.json ]; then
+  if command -v node >/dev/null 2>&1; then
+    node -e 'const fs=require("fs"),p=require("./package.json");p.version=process.argv[1];fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")' "$NEW_VERSION" || {
+      echo "ERROR: failed to update package.json. VERSION was written but package.json is now stale. Fix and re-run — the new idempotency check will detect the drift."
+      exit 1
+    }
+  elif command -v bun >/dev/null 2>&1; then
+    bun -e 'const fs=require("fs"),p=require("./package.json");p.version=process.argv[1];fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")' "$NEW_VERSION" || {
+      echo "ERROR: failed to update package.json. VERSION was written but package.json is now stale."
+      exit 1
+    }
+  else
+    echo "ERROR: package.json exists but neither node nor bun is available."
+    exit 1
+  fi
+fi
+```
+
+**DRIFT_STALE_PKG 修复路径**——当幂等性报告 `STATE: DRIFT_STALE_PKG` 时运行。不重新升级；将 `package.json.version` 同步到当前 `VERSION` 并继续。在 CHANGELOG 和 PR body 中重用 `CURRENT_VERSION`。
+
+```bash
+REPAIR_VERSION=$(cat VERSION | tr -d '\r\n[:space:]')
+if ! printf '%s' "$REPAIR_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+  echo "ERROR: VERSION file contents ($REPAIR_VERSION) do not match MAJOR.MINOR.PATCH.MICRO pattern. Refusing to propagate invalid semver into package.json. Fix VERSION manually, then re-run /ship."
+  exit 1
+fi
+if command -v node >/dev/null 2>&1; then
+  node -e 'const fs=require("fs"),p=require("./package.json");p.version=process.argv[1];fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")' "$REPAIR_VERSION" || {
+    echo "ERROR: drift repair failed — could not update package.json."
+    exit 1
+  }
+else
+  bun -e 'const fs=require("fs"),p=require("./package.json");p.version=process.argv[1];fs.writeFileSync("package.json",JSON.stringify(p,null,2)+"\n")' "$REPAIR_VERSION" || {
+    echo "ERROR: drift repair failed."
+    exit 1
+  }
+fi
+echo "Drift repaired: package.json synced to $REPAIR_VERSION. No version bump performed."
+```
+
+---
+
+{{CHANGELOG_WORKFLOW}}
+
+---
+
+## 步骤 14：TODOS.md（自动更新）
+
+交叉引用项目的 TODOS.md 与本次发布的变更。自动标记已完成的项；仅在文件缺失或组织混乱时才提示用户。
+
+读取 `.claude/skills/review/TODOS-format.md` 作为规范格式参考。
+
+**1. 检查 TODOS.md 是否存在**于仓库根目录。
+
+**如果 TODOS.md 不存在：** 使用 AskUserQuestion：
+- 消息："GStack 建议维护一个按技能/组件组织，然后按优先级排列（P0 在顶部到 P4，最后是 Completed 在底部）的 TODOS.md。请参阅 TODOS-format.md 了解完整格式。你想要创建一个吗？"
+- 选项：A) 现在创建，B) 暂时跳过
+- 如果 A：创建带有骨架的 `TODOS.md`（# TODOS 标题 + ## Completed 部分）。继续到步骤 3。
+- 如果 B：跳过步骤 14 的其余部分。继续到步骤 15。
+
+**2. 检查结构和组织：**
+
+读取 TODOS.md 并验证它是否遵循推荐的结构：
+- 项按 `## <Skill/Component>` 标题分组
+- 每个项都有 `**Priority:**` 字段，值为 P0-P4
+- 底部有 `## Completed` 部分
+
+**如果组织混乱**（缺少优先级字段、没有组件分组、没有 Completed 部分）：使用 AskUserQuestion：
+- 消息："TODOS.md 不符合推荐的结构（技能/组件分组、P0-P4 优先级、Completed 部分）。你想要重新组织它吗？"
+- 选项：A) 现在重新组织（推荐），B) 保持原样
+- 如果 A：遵循 TODOS-format.md 在原处重新组织。保留所有内容——只重组，永远不要删除项。
+- 如果 B：继续到步骤 3，不进行重组。
+
+**3. 检测已完成的 TODO：**
+
+此步骤完全自动——无需用户交互。
+
+使用前面步骤中已收集的 diff 和提交历史：
+- `git diff <base>...HEAD`（针对基础分支的完整 diff）
+- `git log <base>..HEAD --oneline`（本次发布的所有提交）
+
+对于每个 TODO 项，通过以下方式检查此 PR 中的变更是否完成了它：
+- 将提交消息与 TODO 标题和描述进行匹配
+- 检查 TODO 引用的文件是否出现在 diff 中
+- 检查 TODO 描述的工作是否与功能变更匹配
+
+**保守判断：** 只有在 diff 中有明确证据时才将 TODO 标记为完成。如果不确定，保持原样。
+
+**4. 移动已完成项**到底部的 `## Completed` 部分。追加：`**Completed:** vX.Y.Z (YYYY-MM-DD)`
+
+**5. 输出摘要：**
+- `TODOS.md：N 个项标记为完成（item1、item2、...）。M 个项剩余。`
+- 或：`TODOS.md：未检测到已完成的项。M 个项剩余。`
+- 或：`TODOS.md：已创建。` / `TODOS.md：已重新组织。`
+
+**6. 防御性处理：** 如果无法写入 TODOS.md（权限错误、磁盘已满），警告用户并继续。永远不要因 TODOS 失败而停止 ship 工作流。
+
+保存此摘要——它将在步骤 19 中放入 PR body。
+
+---
+
+## 步骤 15：提交（可二分查找的块）
+
+### 步骤 15.0：WIP 提交压缩（仅连续检查点模式）
+
+如果 `CHECKPOINT_MODE` 为 `"continuous"`，分支可能包含来自自动检查点的 `WIP:` 提交。
+这些必须在步骤 15.1 的可二分查找分组逻辑运行之前被压缩到对应的逻辑提交中。
+分支上的非 WIP 提交（先前已发布的工作）必须保留。
+
+**检测：**
+```bash
+WIP_COUNT=$(git log <base>..HEAD --oneline --grep="^WIP:" 2>/dev/null | wc -l | tr -d ' ')
+echo "WIP_COMMITS: $WIP_COUNT"
+```
+
+如果 `WIP_COUNT` 为 0：完全跳过此子步骤。
+
+如果 `WIP_COUNT` > 0，首先收集 WIP 上下文，使其在压缩后仍然存在：
+
+```bash
+# 导出此分支上所有 WIP 提交的 [gstack-context] 块。
+# 此文件作为 CHANGELOG 条目的输入，并可能为 PR body 上下文提供信息。
+mkdir -p "$(git rev-parse --show-toplevel)/.gstack"
+git log <base>..HEAD --grep="^WIP:" --format="%H%n%B%n---END---" > \
+  "$(git rev-parse --show-toplevel)/.gstack/wip-context-before-squash.md" 2>/dev/null || true
+```
+
+**非破坏性压缩策略：**
+
+`git reset --soft <merge-base>` 会取消提交包括非 WIP 提交在内的所有内容。
+**不要这样做。** 相反，使用 `git rebase` 仅过滤 WIP 提交。
+
+选项 1（首选，如果有非 WIP 提交混合）：
+```bash
+# 交互式 rebase，自动压缩 WIP 提交。
+# 将每个 WIP 提交标记为 'fixup'（丢弃其消息，将变更合并到前一个提交）。
+git rebase -i $(git merge-base HEAD origin/<base>) \
+  --exec 'true' \
+  -X ours 2>/dev/null || {
+    echo "Rebase conflict. Aborting: git rebase --abort"
+    git rebase --abort
+    echo "STATUS: BLOCKED — manual WIP squash required"
+    exit 1
+  }
+```
+
+选项 2（更简单，如果分支目前只有 WIP 提交——没有已发布的工作）：
+```bash
+# 分支只包含 WIP 提交。这里 reset-soft 是安全的，因为
+# 没有需要保留的非 WIP 内容。先验证。
+NON_WIP=$(git log <base>..HEAD --oneline --invert-grep --grep="^WIP:" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$NON_WIP" -eq 0 ]; then
+  git reset --soft $(git merge-base HEAD origin/<base>)
+  echo "WIP-only branch, reset-soft to merge base. Step 15.1 will create clean commits."
+fi
+```
+
+在运行时决定适用哪个选项。如果不确定，倾向于通过 AskUserQuestion 停止并询问用户，而不是销毁非 WIP 提交。
+
+**防误操作规则：**
+- 如果有非 WIP 提交，**永远不要**盲目执行 `git reset --soft`。Codex 已标记这是破坏性的——它会取消提交真实的已发布工作，并使推送步骤变成非快进推送。
+- 只有在 WIP 提交成功压缩/吸收后，或已验证分支只包含 WIP 工作，才能继续到步骤 15.1。
+
+### 步骤 15.1：可二分查找的提交
+
+**目标：** 创建小型的、逻辑清晰的提交，这些提交与 `git bisect` 配合良好，并帮助 LLM 理解变更内容。
+
+1. 分析 diff 并将变更分组为逻辑提交。每个提交应代表**一个连贯的变更**——不是一个文件，而是一个逻辑单元。
+
+2. **提交顺序**（先提交前面的）：
+   - **基础设施：** 迁移、配置变更、路由添加
+   - **模型与服务：** 新模型、服务、concern（及其测试）
+   - **控制器与视图：** 控制器、视图、JS/React 组件（及其测试）
+   - **VERSION + CHANGELOG + TODOS.md：** 始终在最后一次提交中
+
+3. **拆分规则：**
+   - 模型及其测试文件放在同一个提交中
+   - 服务及其测试文件放在同一个提交中
+   - 控制器、其视图及其测试放在同一个提交中
+   - 迁移自成一次提交（或与支持它的模型分组）
+   - 配置/路由变更可以与它们支持的功能分组
+   - 如果总 diff 很小（少于 50 行、少于 4 个文件），一次提交即可
+
+4. **每个提交必须独立有效**——没有破损的导入，没有引用尚不存在的代码。按依赖顺序排列提交。
+
+5. 编写每个提交消息：
+   - 第一行：`<type>: <summary>`（type = feat/fix/chore/refactor/docs）
+   - 正文：简要描述此提交包含的内容
+   - 只有**最后一次提交**（VERSION + CHANGELOG）获得版本标签和合著者尾注：
+
+```bash
+git commit -m "$(cat <<'EOF'
+chore: bump version and changelog (vX.Y.Z.W)
+
+{{CO_AUTHOR_TRAILER}}
+EOF
+)"
+```
+
+---
+
+## 步骤 16：验证门控
+
+**铁律：没有新鲜验证证据就不能声称完成。**
+
+在推送之前，如果步骤 4-6 期间代码发生变更，需要重新验证：
+
+1. **测试验证：** 如果步骤 5 的测试运行后有**任何**代码变更（审查发现的修复、CHANGELOG 编辑不算），重新运行测试套件。粘贴新鲜输出。步骤 5 的过期输出**不可接受**。
+
+2. **构建验证：** 如果项目有构建步骤，运行它。粘贴输出。
+
+3. **防止自我合理化：**
+   - "现在应该可以了" → **运行它**。
+   - "我有信心" → 信心不是证据。
+   - "我之前已经测试过了" → 从那以后代码变更了。再次测试。
+   - "这是一个小改动" → 小改动也会搞崩生产环境。
+
+**如果此时测试失败：** 停止。不要推送。修复问题并返回步骤 5。
+
+在没有验证的情况下声称工作完成是欺骗，不是效率。
+
+---
+
+## 步骤 17：推送
+
+**幂等性检查：** 检查分支是否已经推送且是最新的。
+
+```bash
+git fetch origin <branch-name> 2>/dev/null
+LOCAL=$(git rev-parse HEAD)
+REMOTE=$(git rev-parse origin/<branch-name> 2>/dev/null || echo "none")
+echo "LOCAL: $LOCAL  REMOTE: $REMOTE"
+[ "$LOCAL" = "$REMOTE" ] && echo "ALREADY_PUSHED" || echo "PUSH_NEEDED"
+```
+
+如果 `ALREADY_PUSHED`，跳过推送但继续到步骤 18。否则使用上游跟踪推送：
+
+```bash
+git push -u origin <branch-name>
+```
+
+**你还没有完成。** 代码已推送，但文档同步和 PR 创建是强制性的最终步骤。继续到步骤 18。
+
+---
+
+## 步骤 18：文档同步（通过子代理，在 PR 创建之前）
+
+**将 /document-release 作为子代理分派**，使用 Agent 工具并设置 `subagent_type: "general-purpose"`。子代理获得全新的上下文窗口——前面 17 步零腐化。它还运行**完整**的 `/document-release` 工作流（包含 CHANGELOG 覆盖保护、文档排除、高风险变更门控、命名暂存、竞争安全 PR body 编辑），而不是较弱的重新实现。
+
+**顺序：** 此步骤在步骤 17（推送）之后、步骤 19（创建 PR）之前运行。PR 从最终 HEAD 一次性创建，`## Documentation` 部分已烘焙到初始 body 中。不需要先创建再重新编辑。
+
+**子代理提示：**
+
+> 你正在执行代码推送后的 /document-release 工作流。读取完整的技能文件 `${HOME}/.trae/skills/gstack/document-release/SKILL.md` 并端到端执行其完整工作流，包括 CHANGELOG 覆盖保护、文档排除、高风险变更门控和命名暂存。**不要**尝试编辑 PR body——尚不存在 PR。分支：`<branch>`，基础：`<base>`。
+>
+> 完成工作流后，在响应的**最后一行**输出一个 JSON 对象（之后不要有其他文本）：
+> `{"files_updated":["README.md","CLAUDE.md",...],"commit_sha":"abc1234","pushed":true,"documentation_section":"<用于 PR body 的 ## Documentation 部分的 Markdown 块>"}`
+>
+> 如果没有需要更新的文档文件，输出：
+> `{"files_updated":[],"commit_sha":null,"pushed":false,"documentation_section":null}`
+
+**父代理处理：**
+
+1. 将子代理输出的最后一行解析为 JSON。
+2. 存储 `documentation_section`——步骤 19 将其嵌入 PR body（如果为 null 则省略该部分）。
+3. 如果 `files_updated` 非空，打印：`文档同步：{files_updated.length} 个文件已更新，提交为 {commit_sha}`。
+4. 如果 `files_updated` 为空，打印：`文档已是最新——无需更新。`
+
+**如果子代理失败或返回无效 JSON：** 打印警告并在没有 `## Documentation` 部分的情况下继续到步骤 19。不要因为子代理失败而阻断 /ship。用户可以在 PR 发布后手动运行 `/document-release`。
+
+---
+
+## 步骤 19：创建 PR/MR
+
+**幂等性检查：** 检查此分支是否已存在 PR/MR。
+
+**如果是 GitHub：**
+```bash
+gh pr view --json url,number,state -q 'if .state == "OPEN" then "PR #\(.number): \(.url)" else "NO_PR" end' 2>/dev/null || echo "NO_PR"
+```
+
+**如果是 GitLab：**
+```bash
+glab mr view -F json 2>/dev/null | jq -r 'if .state == "opened" then "MR_EXISTS" else "NO_MR" end' 2>/dev/null || echo "NO_MR"
+```
+
+如果已存在**开放**的 PR/MR：**更新** PR body，使用 `gh pr edit --body "..."`（GitHub）或 `glab mr update -d "..."`（GitLab）。始终使用本次运行的新鲜结果从头重新生成 PR body（测试输出、覆盖率审计、审查发现、对抗性审查、TODOS 摘要、步骤 18 的 documentation_section）。永远不要重用先前运行的过时 PR body 内容。
+
+**同时更新 PR 标题**，如果版本在重新运行时发生了变化。PR 标题使用工作空间感知格式 `v<NEW_VERSION> <type>: <summary>`——版本**始终**在前。如果当前标题的版本前缀与 `NEW_VERSION` 不匹配，运行 `gh pr edit --title "v$NEW_VERSION <type>: <summary>"`（或等效的 `glab mr update -t ...`）。这保持了标题的诚实性，当步骤 12 的队列漂移检测重新升级过时版本时。如果标题没有 `v<X.Y.Z.W>` 前缀（有意保留的自定义标题），保持标题不变——只重写已经遵循格式的标题。
+
+打印现有 URL 并继续到步骤 20。
+
+如果不存在 PR/MR：使用步骤 0 中检测到的平台创建拉取请求（GitHub）或合并请求（GitLab）。
+
+PR/MR body 应包含以下部分：
+
+```
+## Summary
+<总结本次发布的**所有**变更。运行 `git log <base>..HEAD --oneline` 枚举
+每个提交。排除 VERSION/CHANGELOG 元数据提交（那是此 PR 的记账工作，
+不是实质性变更）。将剩余提交分组为逻辑部分（例如，
+"**性能**"、"**死代码移除**"、"**基础设施**"）。每个实质性提交
+必须出现在至少一个部分中。如果某个提交的工作没有反映在摘要中，
+说明你遗漏了它。>
+
+## Test Coverage
+<来自步骤 7 的覆盖率图表，或 "所有新代码路径都有测试覆盖。">
+<如果步骤 7 运行了："测试：{before} → {after}（+{delta} 个新测试）">
+
+## Pre-Landing Review
+<来自步骤 9 代码审查的发现，或 "未发现问题。">
+
+## Design Review
+<如果运行了设计审查："设计审查（轻量级）：N 个发现——M 个自动修复，K 个跳过。AI 垃圾内容：clean/N 个问题。">
+<如果没有前端文件变更："没有前端文件变更——跳过设计审查。">
+
+## Eval Results
+<如果运行了评估：套件名称、通过/失败数量、成本仪表板摘要。如果跳过了："没有 prompt 相关文件变更——跳过评估。">
+
+## Greptile Review
+<如果找到了 Greptile 评论：带有 [FIXED] / [FALSE POSITIVE] / [ALREADY FIXED] 标签的项目符号列表 + 每个评论的一行摘要>
+<如果没有 Greptile 评论："没有 Greptile 评论。">
+<如果步骤 10 期间不存在 PR：完全省略此部分>
+
+## Scope Drift
+<如果运行了范围漂移检查："范围检查：CLEAN" 或列出漂移/蔓延发现>
+<如果没有运行范围漂移：省略此部分>
+
+## Plan Completion
+<如果找到计划文件：来自步骤 8 的完成检查清单摘要>
+<如果没有计划文件："未检测到计划文件。">
+<如果有计划项被延后：列出延后项>
+
+## Verification Results
+<如果运行了验证：来自步骤 8.1 的摘要（N 通过，M 失败，K 跳过）>
+<如果跳过了：原因（无计划、无服务器、无验证部分）>
+<如果不适用：省略此部分>
+
+## TODOS
+<如果有项标记为完成：带有版本号的已完成项列表>
+<如果没有任何项完成："此 PR 中没有任何 TODO 项完成。">
+<如果创建或重新组织了 TODOS.md：注明>
+<如果 TODOS.md 不存在且用户跳过了：省略此部分>
+
+## Documentation
+<在此处逐字嵌入步骤 18 子代理返回的 `documentation_section` 字符串。>
+<如果步骤 18 返回 `documentation_section: null`（无文档更新），完全省略此部分。>
+
+## Test plan
+- [x] 所有 Rails 测试通过（N 次运行，0 个失败）
+- [x] 所有 Vitest 测试通过（N 个测试）
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+```
+
+**如果是 GitHub：**
+
+```bash
+gh pr create --base <base> --title "v$NEW_VERSION <type>: <summary>" --body "$(cat <<'EOF'
+<上面的 PR body>
+EOF
+)"
+```
+
+**如果是 GitLab：**
+
+```bash
+glab mr create -b <base> -t "v$NEW_VERSION <type>: <summary>" -d "$(cat <<'EOF'
+<上面的 MR body>
+EOF
+)"
+```
+
+**如果两个 CLI 都不可用：**
+打印分支名称、远程 URL，并指导用户通过 Web UI 手动创建 PR/MR。不要停止——代码已推送并准备就绪。
+
+**输出 PR/MR URL**——然后继续到步骤 20。
+
+---
+
+## 步骤 20：持久化 ship 指标
+
+记录覆盖率和计划完成度数据，以便 `/retro` 可以跟踪趋势：
+
+```bash
+eval "$(.trae/skills/gstack/bin/gstack-slug 2>/dev/null)" && mkdir -p ~/.gstack/projects/$SLUG
+```
+
+追加到 `~/.gstack/projects/$SLUG/$BRANCH-reviews.jsonl`：
+
+```bash
+echo '{"skill":"ship","timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","coverage_pct":COVERAGE_PCT,"plan_items_total":PLAN_TOTAL,"plan_items_done":PLAN_DONE,"verification_result":"VERIFY_RESULT","version":"VERSION","branch":"BRANCH"}' >> ~/.gstack/projects/$SLUG/$BRANCH-reviews.jsonl
+```
+
+从先前步骤替换：
+- **COVERAGE_PCT**：来自步骤 7 图表的覆盖率百分比（整数，如果无法确定则为 -1）
+- **PLAN_TOTAL**：步骤 8 中提取的计划项总数（如果没有计划文件则为 0）
+- **PLAN_DONE**：步骤 8 中 DONE + CHANGED 项的数量（如果没有计划文件则为 0）
+- **VERIFY_RESULT**：来自步骤 8.1 的 "pass"、"fail" 或 "skipped"
+- **VERSION**：来自 VERSION 文件
+- **BRANCH**：当前分支名称
+
+此步骤是自动的——永远不要跳过，永远不要请求确认。
+
+---
+
+## 重要规则
+
+- **永远不要跳过测试。** 如果测试失败，停止。
+- **永远不要跳过发布前审查。** 如果 checklist.md 无法读取，停止。
+- **永远不要强制推送。** 只使用常规的 `git push`。
+- **永远不要请求琐碎确认**（例如，"准备推送？"、"创建 PR？"）。**仅在以下情况停止**：版本升级（MINOR/MAJOR）、发布前审查发现（ASK 项）和 Codex 结构化审查 [P1] 发现（仅限大型 diff）。
+- **始终使用 VERSION 文件中的 4 位版本号格式。**
+- **CHANGELOG 中的日期格式：** `YYYY-MM-DD`
+- **拆分提交以便可二分查找**——每个提交 = 一个逻辑变更。
+- **TODOS.md 完成检测必须保守。** 仅在 diff 清楚显示工作已完成时才将项标记为完成。
+- **使用 greptile-triage.md 中的 Greptile 回复模板。** 每个回复都包含证据（内联 diff、代码引用、重新排名建议）。永远不要发布模糊的回复。
+- **永远不要在新鲜验证证据不足的情况下推送。** 如果步骤 5 测试后代码发生变更，在推送前重新运行。
+- **步骤 7 生成覆盖率测试。** 它们必须在提交前通过。永远不要提交失败的测试。
+- **目标是：用户说 `/ship`，他们接下来看到的是审查 + PR URL + 自动同步的文档。**

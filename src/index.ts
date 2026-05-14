@@ -20,6 +20,7 @@ function getConfig(): DamengConfig {
   const host = process.env.DAMENG_HOST;
   const port = process.env.DAMENG_PORT;
   const dbName = process.env.DAMENG_DB;
+  const schema = process.env.DAMENG_SCHEMA;
   const user = process.env.DAMENG_USER;
   const password = process.env.DAMENG_PASSWORD;
 
@@ -36,7 +37,7 @@ function getConfig(): DamengConfig {
     dbName || ""
   );
 
-  return { url: finalUrl, user, password };
+  return { url: finalUrl, user, password, schema };
 }
 
 async function main() {

@@ -1,0 +1,221 @@
+---
+name: browse
+preamble-tier: 1
+version: 1.1.0
+description: |
+  用于 QA 测试和站点体验的快速无头浏览器。导航到任何 URL、与元素交互、
+  验证页面状态、对比操作前后的差异、拍摄带注释的截图、检查响应式布局、
+  测试表单和上传、处理对话框，以及断言元素状态。
+  每个命令约 100ms。当你需要测试功能、验证部署、体验用户流程、
+  或提交带证据的 bug 时使用此技能。当被要求 "open in browser"（在浏览器中打开）、
+  "test the site"（测试站点）、"take a screenshot"（截图）或 "dogfood this"
+  （体验这个）时使用此技能。（gstack）
+triggers:
+  - browse a page
+  - headless browser
+  - take page screenshot
+allowed-tools:
+  - Bash
+  - Read
+  - AskUserQuestion
+
+---
+
+{{PREAMBLE}}
+
+# browse：QA 测试与产品体验
+
+持久化的无头 Chromium。首次调用自动启动（约 3 秒），之后每个命令约 100ms。
+状态在调用之间保持（cookie、标签页、登录会话）。
+
+{{BROWSE_SETUP}}
+
+## 核心 QA 模式
+
+### 1. 验证页面正确加载
+```bash
+$B goto https://yourapp.com
+$B text                          # 内容加载了吗？
+$B console                       # 有 JS 错误吗？
+$B network                       # 有失败的请求吗？
+$B is visible ".main-content"    # 关键元素存在吗？
+```
+
+### 2. 测试用户流程
+```bash
+$B goto https://app.com/login
+$B snapshot -i                   # 查看所有交互元素
+$B fill @e3 "user@test.com"
+$B fill @e4 "password"
+$B click @e5                     # 提交
+$B snapshot -D                   # 差异：提交后什么变了？
+$B is visible ".dashboard"       # 成功状态出现了吗？
+```
+
+### 3. 验证操作是否生效
+```bash
+$B snapshot                      # 基线
+$B click @e3                     # 做某事
+$B snapshot -D                   # 统一差异显示确切的变化
+```
+
+### 4. 为 bug 报告提供视觉证据
+```bash
+$B snapshot -i -a -o /tmp/annotated.png   # 带标签的截图
+$B screenshot /tmp/bug.png                # 纯截图
+$B console                                # 错误日志
+```
+
+### 5. 查找所有可点击元素（包括非 ARIA）
+```bash
+$B snapshot -C                   # 查找带 cursor:pointer、onclick、tabindex 的 div
+$B click @c1                     # 与它们交互
+```
+
+### 6. 断言元素状态
+```bash
+$B is visible ".modal"
+$B is enabled "#submit-btn"
+$B is disabled "#submit-btn"
+$B is checked "#agree-checkbox"
+$B is editable "#name-field"
+$B is focused "#search-input"
+$B js "document.body.textContent.includes('Success')"
+```
+
+### 7. 测试响应式布局
+```bash
+$B responsive /tmp/layout        # 手机 + 平板 + 桌面截图
+$B viewport 375x812              # 或设置特定视口
+$B screenshot /tmp/mobile.png
+```
+
+### 8. 测试文件上传
+```bash
+$B upload "#file-input" /path/to/file.pdf
+$B is visible ".upload-success"
+```
+
+### 9. 测试对话框
+```bash
+$B dialog-accept "yes"           # 设置处理器
+$B click "#delete-button"        # 触发对话框
+$B dialog                        # 查看出现的内容
+$B snapshot -D                   # 验证删除已发生
+```
+
+### 10. 对比环境
+```bash
+$B diff https://staging.app.com https://prod.app.com
+```
+
+### 11. 向用户展示截图
+在执行 `$B screenshot`、`$B snapshot -a -o` 或 `$B responsive` 之后，始终对输出的 PNG 使用 Read 工具，以便用户能看到它们。否则截图是不可见的。
+
+### 12. 渲染本地 HTML（不需要 HTTP 服务器）
+两条路径，选择更干净的一条：
+```bash
+# 磁盘上的 HTML 文件 → goto file://（绝对路径，或相对于 cwd）
+$B goto file:///tmp/report.html
+$B goto file://./docs/page.html        # 相对于 cwd
+$B goto file://~/Documents/page.html   # 相对于 home
+
+# 内存中生成的 HTML → load-html 读取文件到 setContent
+echo '<div class="tweet">hello</div>' > /tmp/tweet.html
+$B load-html /tmp/tweet.html
+```
+
+`goto file://...` 通常更干净（URL 保存在状态中，相对资源 URL 相对于文件目录解析，缩放变更自然重放）。`load-html` 使用 `page.setContent()`——URL 保持 `about:blank`，但内容通过内存重放能在 `viewport --scale` 中存活。两者都限定在 cwd 或 `$TMPDIR` 下的文件。
+
+### 13. 视网膜截图（deviceScaleFactor）
+```bash
+$B viewport 480x600 --scale 2       # 2x deviceScaleFactor
+$B load-html /tmp/tweet.html        # 或：$B goto file://./tweet.html
+$B screenshot /tmp/out.png --selector .tweet-card
+# → /tmp/out.png 是该元素像素尺寸的 2 倍
+```
+缩放必须在 1-3 之间（gstack 策略上限）。更改 `--scale` 会重新创建浏览器上下文；`snapshot` 的引用失效（重新运行 `snapshot`），但 `load-html` 内容会自动重放。不支持有头模式。
+
+## Puppeteer → browse 速查表
+
+从 Puppeteer 迁移？以下是核心工作流的 1:1 映射：
+
+| Puppeteer | browse |
+|---|---|
+| `await page.goto(url)` | `$B goto <url>` |
+| `await page.setContent(html)` | `$B load-html <file>`（或 `$B goto file://<abs>`） |
+| `await page.setViewport({width, height})` | `$B viewport WxH` |
+| `await page.setViewport({width, height, deviceScaleFactor: 2})` | `$B viewport WxH --scale 2` |
+| `await (await page.$('.x')).screenshot({path})` | `$B screenshot <path> --selector .x` |
+| `await page.screenshot({fullPage: true, path})` | `$B screenshot <path>`（默认全页） |
+| `await page.screenshot({clip: {x, y, w, h}, path})` | `$B screenshot <path> --clip x,y,w,h` |
+
+实际示例（tweet-renderer 流程——Puppeteer → browse）：
+
+```bash
+# 在内存中生成 HTML，以 2x 缩放渲染，截取 tweet 卡片截图。
+echo '<div class="tweet-card" style="width:400px;height:200px;background:#1da1f2;color:white;padding:20px">hello</div>' > /tmp/tweet.html
+$B viewport 480x600 --scale 2
+$B load-html /tmp/tweet.html
+$B screenshot /tmp/out.png --selector .tweet-card
+# /tmp/out.png 是 800x400 像素，清晰（2x deviceScaleFactor）。
+```
+
+别名：输入 `setcontent` 或 `set-content` 会自动路由到 `load-html`。输入拼写错误（`load-htm`）会返回 `Did you mean 'load-html'?`。
+
+## 用户交接
+
+当在无头模式下遇到无法处理的情况（CAPTCHA、复杂认证、多因素登录）时，交接给用户：
+
+```bash
+# 1. 在当前页面打开可见的 Chrome
+$B handoff "Stuck on CAPTCHA at login page"
+
+# 2. 告诉用户发生了什么（通过 AskUserQuestion）
+#    "我已在登录页面打开了 Chrome。请解决 CAPTCHA
+#     完成后告诉我。"
+
+# 3. 当用户说"完成"后，重新快照并继续
+$B resume
+```
+
+**何时使用交接：**
+- CAPTCHA 或机器人检测
+- 多因素认证（短信、身份验证器应用）
+- 需要用户交互的 OAuth 流程
+- AI 尝试 3 次后仍无法处理的复杂交互
+
+浏览器在交接过程中保留所有状态（cookie、localStorage、标签页）。
+在 `resume` 之后，你会获得用户离开位置的全新快照。
+
+## 快照标志
+
+{{SNAPSHOT_FLAGS}}
+
+## CSS 检查器与样式修改
+
+### 检查元素 CSS
+```bash
+$B inspect .header              # 选择器的完整 CSS 级联
+$B inspect                      # 侧边栏中最后选择的元素
+$B inspect --all                # 包含用户代理样式表规则
+$B inspect --history            # 显示修改历史
+```
+
+### 实时修改样式
+```bash
+$B style .header background-color #1a1a1a   # 修改 CSS 属性
+$B style --undo                              # 撤销上次更改
+$B style --undo 2                            # 撤销特定更改
+```
+
+### 干净截图
+```bash
+$B cleanup --all                 # 移除广告、cookie、固定栏、社交
+$B cleanup --ads --cookies       # 选择性清理
+$B prettyscreenshot --cleanup --scroll-to ".pricing" --width 1440 ~/Desktop/hero.png
+```
+
+## 完整命令列表
+
+{{COMMAND_REFERENCE}}

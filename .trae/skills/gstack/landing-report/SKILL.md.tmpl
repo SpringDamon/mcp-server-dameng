@@ -1,0 +1,161 @@
+---
+name: landing-report
+version: 0.1.0
+description: |
+  只读队列仪表板，用于工作区感知的 ship 功能。显示哪些 VERSION 槽位当前被
+  打开的 PR 认领，哪些并行的 Conductor 工作区可能有即将发布的 WIP 工作，以及
+  /ship 下一次会选择哪个槽位。无任何变更操作——仅显示快照。当被要求执行
+  "landing report"、"队列里有什么"、"显示打开的 PR"或"我下一个认领哪个版本"时使用。
+  (gstack)
+triggers:
+  - landing report
+  - version queue
+  - ship queue
+  - what version comes next
+  - show open PR versions
+allowed-tools:
+  - Bash
+  - Read
+sensitive: false
+---
+
+# /landing-report — 版本队列仪表板
+
+{{PREAMBLE}}
+
+---
+
+## 为什么存在这个技能
+
+当你同时运行 5-10 个并行的 Conductor 工作区时，能够快速查看哪些版本号已被
+认领、被谁认领、以及你的下一个 `/ship` 会落在哪个槽位，这将非常有帮助。
+这个技能是对 `/ship` 使用的同一 `bin/gstack-next-version` 工具的只读调用，
+不会进行任何变更操作。可以把它理解为 VERSION 号专用的 `gh pr list`。
+
+---
+
+## 步骤 1：检测平台和基础分支
+
+与其他 gstack 技能相同的检测逻辑。
+
+```bash
+BASE_BRANCH=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || \
+              gh repo view --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null || \
+              echo main)
+echo "Base branch: $BASE_BRANCH"
+```
+
+---
+
+## 步骤 2：读取当前状态
+
+```bash
+CURRENT_VERSION=$(cat VERSION 2>/dev/null | tr -d '[:space:]' || echo "0.0.0.0")
+git fetch origin "$BASE_BRANCH" --quiet 2>/dev/null || true
+BASE_VERSION=$(git show "origin/$BASE_BRANCH:VERSION" 2>/dev/null | tr -d '[:space:]' || echo "$CURRENT_VERSION")
+echo "origin/$BASE_BRANCH VERSION: $BASE_VERSION"
+echo "branch HEAD VERSION: $CURRENT_VERSION"
+```
+
+---
+
+## 步骤 3：查询队列
+
+调用工具三次——分别对应三种 bump 级别——这样用户可以看到 micro/patch/minor/major
+各自会认领什么版本。开销很小（相同的 gh 调用会被 bun 缓存）。
+
+```bash
+for LEVEL in micro patch minor major; do
+  bun run bin/gstack-next-version \
+    --base "$BASE_BRANCH" \
+    --bump "$LEVEL" \
+    --current-version "$BASE_VERSION" \
+    > "/tmp/landing-$LEVEL.json" 2>/dev/null || echo '{"offline":true}' > "/tmp/landing-$LEVEL.json"
+done
+```
+
+---
+
+## 步骤 4：渲染仪表板
+
+构建一个单一表格输出。使用 `patch` 级别的 JSON 作为队列 + 兄弟工作区的规范来源
+（它们在不同 bump 级别下是相同的，只有 `.version` 不同）。
+
+使用 `jq` 提取：
+- `.host` — github | gitlab | unknown
+- `.offline` — 查询是否失败？
+- `.claimed` — {pr, branch, version, url} 数组
+- `.siblings` — 找到的所有兄弟工作树
+- `.active_siblings` — 可能即将发布的子集
+
+按以下精确格式渲染：
+
+```
+╔══════════════════════════════════════════════════════════════════╗
+║                     GSTACK LANDING REPORT                        ║
+╠══════════════════════════════════════════════════════════════════╣
+║ Repo:    <owner/repo>                                            ║
+║ Base:    <base> @ v<base-version>                                ║
+║ Host:    <github|gitlab|unknown>                                 ║
+║ Status:  <ONLINE|OFFLINE: queue-awareness unavailable>           ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Open PRs claiming versions on <base>:
+  #1152  alpha-branch         → v1.7.0.0
+  #1153  beta-branch          → v1.7.0.0  ⚠ collision with #1152
+  #1151  gamma-branch         → v1.6.5.0
+
+Sibling Conductor worktrees (<workspace_root>):
+  path                        branch                 VERSION      last commit   PR
+  ──────────────────────────────────────────────────────────────────────────────────
+  ../tokyo-v2                 feat/dashboard         v1.7.1.0    3h ago         none  ★ active
+  ../melbourne                feat/review            v1.6.0.0    12d ago        none
+  ../osaka                    feat/payments          v1.8.0.0    5h ago         #1155
+
+★ active = VERSION 领先于基础分支 且 最后提交 < 24h 且 没有打开的 PR。
+  这些是可能即将发布的。
+
+如果你现在运行 /ship，你将认领：
+  micro bump:  v1.6.3.1   (queue-advance: none)
+  patch bump:  v1.7.1.0   (bumped past claimed 1.7.0.0)
+  minor bump:  v1.8.0.0   (bumped past claimed 1.7.0.0)
+  major bump:  v2.0.0.0   (no major collisions)
+```
+
+对于离线或未知主机的输出，打印较短的块：
+
+```
+╔══════════════════════════════════════════════════════════════════╗
+║                     GSTACK LANDING REPORT                        ║
+╠══════════════════════════════════════════════════════════════════╣
+║ Status:  OFFLINE — queue-awareness unavailable                   ║
+║ Reason:  <offline reason from warnings>                          ║
+╚══════════════════════════════════════════════════════════════════╝
+
+Fallback: local VERSION bumps still work, but collisions cannot be detected.
+```
+
+---
+
+## 步骤 5：建议下一步操作
+
+渲染表格后，建议以下操作之一：
+
+1. **如果队列中存在冲突**（两个打开的 PR 认领了相同的版本）：
+   "⚠ 两个打开的 PR 在 v<X> 上发生冲突。后合并的那个要么会覆盖先合并者的
+   CHANGELOG 条目，要么会重复着陆。可以考虑让其中一个作者重新运行 /ship 以
+   获取下一个空闲槽位。"
+
+2. **如果有活跃的兄弟工作区优先级高于用户分支的版本**：
+   "兄弟工作树 <path> 在 <N> 小时前提交了 v<X>，但还没有创建 PR。
+   如果该工作先发布，你的分支在合并时将需要重新提升版本号。"
+
+3. **如果一切看起来都很干净**：
+   "队列是干净的。下一个 /ship 将无冲突地认领一个槽位。"
+
+---
+
+## 计划模式
+
+计划模式异常 — 始终运行。此技能完全是只读的：不写入文件、不改变 git 状态、
+不改变网络状态。可以安全地在计划模式下运行。

@@ -1,0 +1,231 @@
+---
+name: setup-deploy
+preamble-tier: 1
+interactive: true
+description: |
+  部署 gstack 项目到生产环境。
+  当被要求"部署"、"发布到生产"或"上线"时使用。(gstack)
+allowed-tools: [Bash, Edit, Glob, Read, Write, Grep, AskUserQuestion, WebFetch, WebSearch]
+voice-triggers:
+  - deploy
+  - deploy now
+  - ship it
+triggers:
+  - deploy
+  - deploy now
+  - ship it
+---
+
+{{PREAMBLE}}
+
+# 部署
+
+在生产环境中设置你的项目——实时站点，真实用户。
+
+## 0. 预部署检查
+
+在设置之前，验证以下内容。对于每个检查，显示
+当前状态和任何失败原因。
+
+### 0A. 部署目标检测
+检测项目类型并推荐部署平台：
+
+```bash
+echo "=== 项目检测 ==="
+git remote -v 2>/dev/null | head -1 || echo "无 git 远程仓库"
+ls package.json 2>/dev/null && echo "Node.js 项目" || true
+ls Dockerfile 2>/dev/null && echo "Docker 项目" || true
+ls docker-compose.yml 2>/dev/null && echo "Docker Compose 项目" || true
+ls next.config.* 2>/dev/null && echo "Next.js 项目" || true
+ls Cargo.toml 2>/dev/null && echo "Rust 项目" || true
+ls go.mod 2>/dev/null && echo "Go 项目" || true
+ls requirements.txt pyproject.toml setup.py 2>/dev/null && echo "Python 项目" || true
+ls CMakeLists.txt Makefile 2>/dev/null && echo "C/C++ 项目" || true
+```
+
+### 0B. 环境状态
+
+```bash
+echo "=== 环境检查 ==="
+echo "Node: $(node --version 2>/dev/null || echo '未安装')"
+echo "npm: $(npm --version 2>/dev/null || echo '未安装')"
+echo "Docker: $(docker --version 2>/dev/null || echo '未安装')"
+echo "Git: $(git --version 2>/dev/null || echo '未安装')"
+```
+
+### 0C. 远程仓库状态
+验证代码是否与远程同步：
+
+```bash
+git status --porcelain 2>/dev/null
+if [ $? -eq 0 ]; then
+    if [ -z "$(git status --porcelain)" ]; then
+        echo "工作树干净"
+    else
+        echo "警告：有未提交的变更"
+    fi
+fi
+```
+
+### 0D. 部署就绪评分
+对部署就绪性评分 0-10：
+- 有未提交的变更？（-1 分）
+- 生产环境变量已配置？（+2 分）
+- CI/CD 管道存在？（+2 分）
+- 测试通过？（+2 分）
+- 有回滚计划？（+2 分）
+- 监控/告警已设置？（+2 分）
+
+AskUserQuestion："我已将部署就绪性评为 {N}/10。继续部署还是先解决缺口？"
+
+**停止。** 在用户确认之前不要继续。
+
+## 1. 部署目标设置
+
+### 1A. 平台选择
+
+基于检测到的项目类型，AskUserQuestion：
+
+> "我检测到这是一个 {项目类型} 项目。你想部署到：
+>
+> A) **Vercel** -- 最适合 Next.js/前端。自动 CI/CD、预览部署、边缘网络。
+>    (设置时间：5 分钟 / 成本：免费层可用)
+>
+> B) **Railway** -- 最适合全栈应用。自动 Docker 构建、简单环境变量。
+>    (设置时间：10 分钟 / 成本：$5/月起)
+>
+> C) **Fly.io** -- 最适合需要全球分布的应用。边缘部署、自定义域名。
+>    (设置时间：15 分钟 / 成本：免费层 + 按使用付费)
+>
+> D) **AWS/GCP/Azure** -- 最适合企业/合规需求。完全控制但复杂。
+>    (设置时间：1 小时+ / 成本：按使用付费)
+>
+> E) **自定义服务器/VPS** -- 完全控制，你管理一切。
+>    (设置时间：取决于配置 / 成本：服务器成本)
+>
+> F) 告诉我你的偏好"
+
+### 1B. 平台设置
+
+**如果 Vercel：**
+```bash
+echo "正在设置 Vercel 部署..."
+npx vercel --version 2>/dev/null || npm install -g vercel
+vercel --version 2>/dev/null || echo "需要手动安装 vercel CLI"
+```
+
+**如果 Railway：**
+```bash
+echo "正在设置 Railway 部署..."
+which railway 2>/dev/null || npm install -g @railway/cli
+railway --version 2>/dev/null || echo "需要手动安装 railway CLI"
+```
+
+**如果 Fly.io：**
+```bash
+echo "正在设置 Fly.io 部署..."
+which fly 2>/dev/null || echo "需要安装 flyctl: https://fly.io/docs/hands-on/install-flyctl/"
+fly version 2>/dev/null || echo "需要手动安装 flyctl"
+```
+
+### 1C. 环境变量
+
+对于每个平台，识别所需的环境变量：
+
+```bash
+echo "=== 环境变量检测 ==="
+grep -r "process.env\|env(" . --include="*.js" --include="*.ts" --include="*.tsx" 2>/dev/null | \
+    grep -oE '[A-Z_][A-Z0-9_]+' | sort -u | head -20 || echo "未检测到环境变量"
+```
+
+AskUserQuestion："你的应用需要这些环境变量：[列出变量]。哪些需要为生产配置？"
+
+## 2. 部署执行
+
+### 2A. 预部署验证
+
+```bash
+echo "=== 预部署验证 ==="
+echo "1. 构建测试..."
+npm run build 2>/dev/null || echo "构建失败——部署中止"
+echo "2. 测试运行..."
+npm test 2>/dev/null || echo "测试未运行——继续但警告"
+echo "3. 生产构建大小..."
+ls -lh dist/ build/ .next/ 2>/dev/null || echo "无构建输出"
+```
+
+### 2B. 部署执行
+
+**Vercel：**
+```bash
+echo "正在部署到 Vercel..."
+vercel --prod --yes 2>/dev/null || echo "需要运行 'vercel' 进行交互式设置"
+```
+
+**Railway：**
+```bash
+echo "正在部署到 Railway..."
+railway up 2>/dev/null || echo "需要运行 'railway login' 然后 'railway up'"
+```
+
+**Fly.io：**
+```bash
+echo "正在部署到 Fly.io..."
+fly deploy 2>/dev/null || echo "需要运行 'fly launch' 然后 'fly deploy'"
+```
+
+### 2C. 部署后验证
+
+```bash
+echo "=== 部署后验证 ==="
+echo "1. 检查站点是否响应..."
+curl -sI "$DEPLOY_URL" 2>/dev/null | head -5 || echo "无法验证——手动检查 $DEPLOY_URL"
+echo "2. 检查错误日志..."
+# 平台特定的日志命令
+echo "3. 运行冒烟测试..."
+echo "手动访问 $DEPLOY_URL 并验证关键流程"
+```
+
+## 3. 监控与告警
+
+设置基础监控：
+
+AskUserQuestion："想要设置部署监控吗？
+A) **Vercel Analytics** -- 自动的，包含在 Vercel 中
+B) **Sentry** -- 错误追踪，免费层 5000 事件/月
+C) **DataDog/NewRelic** -- 全面 APM，企业级
+D) **跳过** -- 我将稍后设置"
+
+## 4. 完成摘要
+
+```
++====================================================================+
+|                    部署完成摘要                                  |
++====================================================================+
+| 平台            | [平台名称]                                     |
+| URL             | [部署 URL]                                     |
+| 状态            | [成功/失败/部分成功]                           |
+| 环境变量      | [已配置 N 个 / 需要 N 个]                        |
+| 监控            | [已设置/未设置]                                |
+| CI/CD          | [已配置/手动]                                  |
+| 回滚计划    | [是/否]                                          |
++====================================================================+
+```
+
+**如果部署成功：** "你的项目已部署到 [URL]。验证关键流程并监控错误。"
+**如果部署失败：** "部署失败。错误：[错误]。解决并重试。"
+**如果部分成功：** "部署完成但有些警告：[列出]。在投入使用前解决。"
+
+## 回滚计划
+
+如果部署有问题，回滚：
+
+**Vercel：** `vercel rollback` 或通过仪表板回滚到先前部署
+**Railway：** 通过仪表板回滚到先前的部署
+**Fly.io：** `fly deploy --image [先前的镜像]`
+
+AskUserQuestion："部署状态如何？
+A) 一切正常——完成
+B) 有问题——帮助我调试
+C) 需要回滚——帮助我回滚
+D) 需要额外配置"

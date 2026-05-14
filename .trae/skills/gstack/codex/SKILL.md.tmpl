@@ -1,0 +1,522 @@
+---
+name: codex
+preamble-tier: 3
+version: 1.0.0
+description: |
+  OpenAI Codex CLI 包装器 — 三种模式。代码审查：通过 codex review 进行独立的 diff 审查，
+  带有通过/失败门控。挑战：对抗模式，试图破坏你的代码。咨询：向 Codex 询问任何问题，
+  支持会话连续性以便后续跟进。"200 IQ 自闭症开发者"的第二意见。使用场景：
+  "codex 审查"、"codex 挑战"、"咨询 codex"、"第二意见"或"请教 codex"。(gstack)
+voice-triggers:
+  - "code x"
+  - "code ex"
+  - "get another opinion"
+triggers:
+  - codex review
+  - second opinion
+  - outside voice challenge
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - Glob
+  - Grep
+  - AskUserQuestion
+---
+
+{{PREAMBLE}}
+
+{{BASE_BRANCH_DETECT}}
+
+# /codex — 多 AI 第二意见
+
+你正在运行 `/codex` 技能。这包装了 OpenAI Codex CLI，以获取来自不同 AI 系统的独立的、
+直言不讳的第二意见。
+
+Codex 是"200 IQ 自闭症开发者" — 直接、简洁、技术精确、挑战假设、捕捉你可能遗漏的东西。
+忠实地呈现其输出，不要做摘要。
+
+---
+
+## 步骤 0：检查 codex 二进制文件
+
+```bash
+CODEX_BIN=$(which codex 2>/dev/null || echo "")
+[ -z "$CODEX_BIN" ] && echo "NOT_FOUND" || echo "FOUND: $CODEX_BIN"
+```
+
+如果 `NOT_FOUND`：停止并告诉用户：
+"未找到 Codex CLI。安装它：`npm install -g @openai/codex` 或参见 https://github.com/openai/codex"
+
+如果 `NOT_FOUND`，同时记录事件：
+```bash
+_TEL=$(.trae/skills/gstack/bin/gstack-config get telemetry 2>/dev/null || echo off)
+source .trae/skills/gstack/bin/gstack-codex-probe 2>/dev/null && _gstack_codex_log_event "codex_cli_missing" 2>/dev/null || true
+```
+
+---
+
+## 步骤 0.5：认证探测 + 版本检查
+
+在构建昂贵的提示之前，验证 Codex 具有有效的认证，并且已安装的
+CLI 版本不在已知有问题的列表中。引入 `gstack-codex-probe` 会加载
+`/codex` 和 `/autoplan` 都使用的共享辅助函数。
+
+```bash
+_TEL=$(.trae/skills/gstack/bin/gstack-config get telemetry 2>/dev/null || echo off)
+source .trae/skills/gstack/bin/gstack-codex-probe
+
+if ! _gstack_codex_auth_probe >/dev/null; then
+  _gstack_codex_log_event "codex_auth_failed"
+  echo "AUTH_FAILED"
+fi
+_gstack_codex_version_check   # 如果是已知有问题的版本则警告，非阻塞性
+```
+
+如果输出包含 `AUTH_FAILED`，停止并告诉用户：
+"未找到 Codex 认证。运行 `codex login` 或设置 `$CODEX_API_KEY` / `$OPENAI_API_KEY`，然后重新运行此技能。"
+
+如果版本检查打印了 `WARN:` 行，原样传递给用户
+（非阻塞 — Codex 可能仍然有效，但用户应该升级）。
+
+探测的多信号认证逻辑接受：设置了 `$CODEX_API_KEY`、设置了 `$OPENAI_API_KEY`、
+或 `${CODEX_HOME:-~/.codex}/auth.json` 存在。避免了对使用环境变量认证的用户
+（CI、平台工程师）的误判，仅检查文件会拒绝这些用户。
+
+**更新已知有问题的列表**：当新的 Codex CLI 版本出现回退时，
+更新 `bin/gstack-codex-probe` 中的列表。当前条目（`0.120.0`、`0.120.1`、`0.120.2`）
+源自 #972 中修复的 stdin 死锁问题。
+
+---
+
+## 步骤 1：检测模式
+
+解析用户的输入以确定运行哪种模式：
+
+1. `/codex review` 或 `/codex review <instructions>` — **审查模式**（步骤 2A）
+2. `/codex challenge` 或 `/codex challenge <focus>` — **挑战模式**（步骤 2B）
+3. `/codex` 无参数 — **自动检测：**
+   - 检查是否存在 diff（如果 origin 不可用则回退）：
+     `git diff origin/<base> --stat 2>/dev/null | tail -1 || git diff <base> --stat 2>/dev/null | tail -1`
+   - 如果存在 diff，使用 AskUserQuestion：
+     ```
+     Codex 检测到与基础分支相比有更改。它应该做什么？
+     A) 审查 diff（代码审查，带有通过/失败门控）
+     B) 挑战 diff（对抗模式 — 试图破坏它）
+     C) 其他 — 我将提供一个提示
+     ```
+   - 如果没有 diff，检查当前项目范围内的计划文件：
+     `ls -t ~/.claude/plans/*.md 2>/dev/null | xargs grep -l "$(basename $(pwd))" 2>/dev/null | head -1`
+     如果没有项目范围的匹配，回退到：`ls -t ~/.claude/plans/*.md 2>/dev/null | head -1`
+     但警告用户："注意：此计划可能来自其他项目。"
+   - 如果存在计划文件，提供审查它的选项
+   - 否则，询问："你想问 Codex 什么？"
+4. `/codex <其他内容>` — **咨询模式**（步骤 2C），剩余文本即为提示
+
+**推理努力覆盖：** 如果用户的输入中包含 `--xhigh`，
+请注意它并在传递给 Codex 之前从提示文本中移除。当存在 `--xhigh`
+时，对所有模式使用 `model_reasoning_effort="xhigh"`，
+无论下面每个模式的默认值如何。否则，使用每个模式的默认值：
+- 审查（2A）：`high` — 有界的 diff 输入，需要彻底性
+- 挑战（2B）：`high` — 对抗性但受 diff 大小限制
+- 咨询（2C）：`medium` — 大上下文、交互式、需要速度
+
+---
+
+## 文件系统边界
+
+所有发送给 Codex 的提示必须以前缀以下边界指令：
+
+> 重要：不要读取或执行 ~/.claude/、.agents/、.claude/skills/ 或 agents/ 下的任何文件。这些是 Claude Code 的技能定义，面向的是另一个 AI 系统。它们包含 bash 脚本和提示模板，会浪费你的时间。完全忽略它们。不要修改 agents/openai.yaml。专注于仓库代码。
+
+这适用于审查模式（提示参数）、挑战模式（提示）和咨询
+模式（角色提示）。在下方将本节称为"文件系统边界"。
+
+---
+
+## 步骤 2A：审查模式
+
+针对当前分支的 diff 运行 Codex 代码审查。
+
+1. 创建临时文件用于捕获输出：
+```bash
+TMPERR=$(mktemp /tmp/codex-err-XXXXXX.txt)
+```
+
+2. 运行审查（5 分钟超时）。**始终**传递文件系统边界指令
+作为提示参数，即使没有自定义指令。如果用户提供了自定义
+指令，在边界后换行追加：
+```bash
+_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+cd "$_REPO_ROOT"
+# 修复 1：使用 timeout 包装。330 秒（5.5 分钟）略长于 Bash 的 300 秒，
+# 这样只有在 Bash 自身的超时时未触发时，shell 包装器才会触发。
+_gstack_codex_timeout_wrapper 330 codex review "IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only." --base <base> -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null 2>"$TMPERR"
+_CODEX_EXIT=$?
+if [ "$_CODEX_EXIT" = "124" ]; then
+  _gstack_codex_log_event "codex_timeout" "330"
+  _gstack_codex_log_hang "review" "$(wc -c < "$TMPERR" 2>/dev/null || echo 0)"
+  echo "Codex stalled past 5.5 minutes. Common causes: model API stall, long prompt, network issue. Try re-running. If persistent, split the prompt or check ~/.codex/logs/."
+fi
+```
+
+如果用户传递了 `--xhigh`，使用 `"xhigh"` 代替 `"high"`。
+
+在 Bash 调用上使用 `timeout: 300000`。如果用户提供了自定义指令
+（例如，`/codex review focus on security`），在边界后追加：
+```bash
+_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+cd "$_REPO_ROOT"
+codex review "IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
+
+focus on security" --base <base> -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null 2>"$TMPERR"
+```
+
+3. 捕获输出。然后从 stderr 解析成本：
+```bash
+grep "tokens used" "$TMPERR" 2>/dev/null || echo "tokens: unknown"
+```
+
+4. 通过检查审查输出中的关键发现来确定门控结果。
+   如果输出包含 `[P1]` — 门控为 **FAIL（失败）**。
+   如果没有找到 `[P1]` 标记（只有 `[P2]` 或没有发现） — 门控为 **PASS（通过）**。
+
+5. 呈现输出：
+
+```
+CODEX SAYS (code review):
+════════════════════════════════════════════════════════════
+<完整的 codex 输出，原样 — 不要截断或摘要>
+════════════════════════════════════════════════════════════
+GATE: PASS                    Tokens: 14,331 | Est. cost: ~$0.12
+```
+
+或
+
+```
+GATE: FAIL (N 个关键发现)
+```
+
+6. **跨模型比较：** 如果 `/review`（Claude 自己的审查）已经在此对话中较早运行过，
+   比较两组发现：
+
+```
+CROSS-MODEL ANALYSIS:
+  Both found: [Claude 和 Codex 重叠的发现]
+  Only Codex found: [Codex 独有的发现]
+  Only Claude found: [Claude /review 独有的发现]
+  Agreement rate: X% (N/M 总独特发现的重叠率)
+```
+
+7. 持久化审查结果：
+```bash
+.trae/skills/gstack/bin/gstack-review-log '{"skill":"codex-review","timestamp":"TIMESTAMP","status":"STATUS","gate":"GATE","findings":N,"findings_fixed":N,"commit":"'"$(git rev-parse --short HEAD)"'"}'
+```
+
+替换：TIMESTAMP（ISO 8601）、STATUS（PASS 为 "clean"，FAIL 为 "issues_found"）、
+GATE（"pass" 或 "fail"）、findings（[P1] + [P2] 标记的数量）、
+findings_fixed（在发布前已解决/修复的发现数量）。
+
+8. 清理临时文件：
+```bash
+rm -f "$TMPERR"
+```
+
+{{PLAN_FILE_REVIEW_REPORT}}
+
+---
+
+## 步骤 2B：挑战（对抗）模式
+
+Codex 试图破坏你的代码 — 发现正常审查会遗漏的边缘情况、竞争条件、安全漏洞
+和失败模式。
+
+1. 构建对抗性提示。**始终前置文件系统边界指令**
+（来自上方的文件系统边界部分）。如果用户提供了关注领域
+（例如，`/codex challenge security`），在边界后包含它：
+
+默认提示（无关注领域）：
+"IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
+
+Review the changes on this branch against the base branch. Run `git diff origin/<base>` to see the diff. Your job is to find ways this code will fail in production. Think like an attacker and a chaos engineer. Find edge cases, race conditions, security holes, resource leaks, failure modes, and silent data corruption paths. Be adversarial. Be thorough. No compliments — just the problems."
+
+带有关注领域（例如，"security"）：
+"IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
+
+Review the changes on this branch against the base branch. Run `git diff origin/<base>` to see the diff. Focus specifically on SECURITY. Your job is to find every way an attacker could exploit this code. Think about injection vectors, auth bypasses, privilege escalation, data exposure, and timing attacks. Be adversarial."
+
+2. 使用 **JSONL 输出** 运行 codex exec 以捕获推理轨迹和工具调用（5 分钟超时）：
+
+如果用户传递了 `--xhigh`，使用 `"xhigh"` 代替 `"high"`。
+
+```bash
+_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+# 修复 1+2：使用 timeout 包装（通过探测辅助函数的 gtimeout/timeout 回退链）、
+# 捕获 stderr 到 $TMPERR 用于认证错误检测（之前是：2>/dev/null）。
+TMPERR=${TMPERR:-$(mktemp /tmp/codex-err-XXXXXX.txt)}
+_gstack_codex_timeout_wrapper 600 codex exec "<prompt>" -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="high"' --enable web_search_cached --json < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 python3 -u -c "
+import sys, json
+turn_completed_count = 0
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+        t = obj.get('type','')
+        if t == 'item.completed' and 'item' in obj:
+            item = obj['item']
+            itype = item.get('type','')
+            text = item.get('text','')
+            if itype == 'reasoning' and text:
+                print(f'[codex thinking] {text}', flush=True)
+                print(flush=True)
+            elif itype == 'agent_message' and text:
+                print(text, flush=True)
+            elif itype == 'command_execution':
+                cmd = item.get('command','')
+                if cmd: print(f'[codex ran] {cmd}', flush=True)
+        elif t == 'turn.completed':
+            turn_completed_count += 1
+            usage = obj.get('usage',{})
+            tokens = usage.get('input_tokens',0) + usage.get('output_tokens',0)
+            if tokens: print(f'\ntokens used: {tokens}', flush=True)
+    except: pass
+# 修复 2：完整性检查 — 如果没有收到 turn.completed 则警告
+if turn_completed_count == 0:
+    print('[codex warning] No turn.completed event received — possible mid-stream disconnect.', flush=True, file=sys.stderr)
+"
+_CODEX_EXIT=${PIPESTATUS[0]}
+# 修复 1：挂起检测 — 记录 + 提供可操作消息
+if [ "$_CODEX_EXIT" = "124" ]; then
+  _gstack_codex_log_event "codex_timeout" "600"
+  _gstack_codex_log_hang "challenge" "$(wc -c < "$TMPERR" 2>/dev/null || echo 0)"
+  echo "Codex stalled past 10 minutes. Common causes: model API stall, long prompt, network issue. Try re-running. If persistent, split the prompt or check ~/.codex/logs/."
+fi
+# 修复 2：从捕获的 stderr 中暴露认证错误，而不是丢弃它们
+if grep -qiE "auth|login|unauthorized" "$TMPERR" 2>/dev/null; then
+  echo "[codex auth error] $(head -1 "$TMPERR")"
+  _gstack_codex_log_event "codex_auth_failed"
+fi
+```
+
+这解析 codex 的 JSONL 事件以提取推理轨迹、工具调用和最终
+响应。`[codex thinking]` 行显示 codex 在回答之前的推理过程。
+
+3. 呈现完整的流式输出：
+
+```
+CODEX SAYS (adversarial challenge):
+════════════════════════════════════════════════════════════
+<上方的完整输出，原样>
+════════════════════════════════════════════════════════════
+Tokens: N | Est. cost: ~$X.XX
+```
+
+---
+
+## 步骤 2C：咨询模式
+
+询问 Codex 关于代码库的任何问题。支持后续跟进的会话连续性。
+
+1. **检查现有会话：**
+```bash
+cat .context/codex-session-id 2>/dev/null || echo "NO_SESSION"
+```
+
+如果存在会话文件（不是 `NO_SESSION`），使用 AskUserQuestion：
+```
+你之前有一个活跃的 Codex 对话。继续还是重新开始？
+A) 继续对话（Codex 记住之前的上下文）
+B) 开始新对话
+```
+
+2. 创建临时文件：
+```bash
+TMPRESP=$(mktemp /tmp/codex-resp-XXXXXX.txt)
+TMPERR=$(mktemp /tmp/codex-err-XXXXXX.txt)
+```
+
+3. **计划审查自动检测：** 如果用户的提示是关于审查计划的，
+或存在计划文件且用户无参数调用 `/codex`：
+```bash
+setopt +o nomatch 2>/dev/null || true  # zsh 兼容
+ls -t ~/.claude/plans/*.md 2>/dev/null | xargs grep -l "$(basename $(pwd))" 2>/dev/null | head -1
+```
+如果没有项目范围的匹配，回退到 `ls -t ~/.claude/plans/*.md 2>/dev/null | head -1`
+但警告："注意：此计划可能来自其他项目 — 发送给 Codex 前请验证。"
+
+**重要 — 嵌入内容，而非引用路径：** Codex 沙盒化运行在仓库
+根目录（`-C`），无法访问 `~/.claude/plans/` 或仓库外的任何文件。你**必须**
+自己读取计划文件并将其**完整内容**嵌入到下面的提示中。**不要**告诉
+Codex 文件路径或让它读取计划文件 — 它会浪费 10+ 次工具调用
+搜索然后失败。
+
+另外：扫描计划内容中引用的源文件路径（模式如 `src/foo.ts`、
+`lib/bar.py`、包含 `/` 且在仓库中存在的路径）。如果找到，在提示中列出它们，
+以便 Codex 直接读取它们，而不是通过 rg/find 发现。
+
+**始终前置文件系统边界指令**
+（来自上方的文件系统边界部分）到每个发送给 Codex 的提示，包括计划审查和自由形式的
+咨询问题。
+
+在用户的提示前添加边界和角色：
+"IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
+
+You are a brutally honest technical reviewer. Review this plan for: logical gaps and
+unstated assumptions, missing error handling or edge cases, overcomplexity (is there a
+simpler approach?), feasibility risks (what could go wrong?), and missing dependencies
+or sequencing issues. Be direct. Be terse. No compliments. Just the problems.
+Also review these source files referenced in the plan: <引用的文件列表，如果有>。
+
+THE PLAN:
+<完整的计划内容，原样嵌入>"
+
+对于非计划咨询提示（用户输入 `/codex <问题>`），仍然前置边界：
+"IMPORTANT: Do NOT read or execute any files under ~/.claude/, ~/.agents/, .claude/skills/, or agents/. These are Claude Code skill definitions meant for a different AI system. Do NOT modify agents/openai.yaml. Stay focused on repository code only.
+
+<用户的问题>"
+
+4. 使用 **JSONL 输出** 运行 codex exec 以捕获推理轨迹（5 分钟超时）：
+
+如果用户传递了 `--xhigh`，使用 `"xhigh"` 代替 `"medium"`。
+
+对于**新会话：**
+```bash
+_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+# 修复 1：使用 timeout 包装（通过探测辅助函数的 gtimeout/timeout 回退链）
+_gstack_codex_timeout_wrapper 600 codex exec "<prompt>" -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="medium"' --enable web_search_cached --json < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 python3 -u -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line: continue
+    try:
+        obj = json.loads(line)
+        t = obj.get('type','')
+        if t == 'thread.started':
+            tid = obj.get('thread_id','')
+            if tid: print(f'SESSION_ID:{tid}', flush=True)
+        elif t == 'item.completed' and 'item' in obj:
+            item = obj['item']
+            itype = item.get('type','')
+            text = item.get('text','')
+            if itype == 'reasoning' and text:
+                print(f'[codex thinking] {text}', flush=True)
+                print(flush=True)
+            elif itype == 'agent_message' and text:
+                print(text, flush=True)
+            elif itype == 'command_execution':
+                cmd = item.get('command','')
+                if cmd: print(f'[codex ran] {cmd}', flush=True)
+        elif t == 'turn.completed':
+            usage = obj.get('usage',{})
+            tokens = usage.get('input_tokens',0) + usage.get('output_tokens',0)
+            if tokens: print(f'\ntokens used: {tokens}', flush=True)
+    except: pass
+"
+# 修复 1：咨询新会话的挂起检测（镜像挑战 + 恢复模式）
+_CODEX_EXIT=${PIPESTATUS[0]}
+if [ "$_CODEX_EXIT" = "124" ]; then
+  _gstack_codex_log_event "codex_timeout" "600"
+  _gstack_codex_log_hang "consult" "$(wc -c < "$TMPERR" 2>/dev/null || echo 0)"
+  echo "Codex stalled past 10 minutes. Common causes: model API stall, long prompt, network issue. Try re-running. If persistent, split the prompt or check ~/.codex/logs/."
+fi
+```
+
+对于**恢复的会话**（用户选择"继续"）：
+```bash
+_REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
+# 修复 1：使用 timeout 包装（通过探测辅助函数的 gtimeout/timeout 回退链）
+_gstack_codex_timeout_wrapper 600 codex exec resume <session-id> "<prompt>" -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="medium"' --enable web_search_cached --json < /dev/null 2>"$TMPERR" | PYTHONUNBUFFERED=1 python3 -u -c "
+<与上方相同的 python 流式解析器，所有 print() 调用都带有 flush=True>
+"
+# 修复 1：与新会话块相同的挂起检测模式
+_CODEX_EXIT=${PIPESTATUS[0]}
+if [ "$_CODEX_EXIT" = "124" ]; then
+  _gstack_codex_log_event "codex_timeout" "600"
+  _gstack_codex_log_hang "consult-resume" "$(wc -c < "$TMPERR" 2>/dev/null || echo 0)"
+  echo "Codex stalled past 10 minutes. Common causes: model API stall, long prompt, network issue. Try re-running. If persistent, split the prompt or check ~/.codex/logs/."
+fi
+
+5. 从流式输出中捕获会话 ID。解析器从 `thread.started` 事件打印 `SESSION_ID:<id>`。
+   保存它以用于后续跟进：
+```bash
+mkdir -p .context
+```
+将解析器打印的会话 ID（以 `SESSION_ID:` 开头的行）
+保存到 `.context/codex-session-id`。
+
+6. 呈现完整的流式输出：
+
+```
+CODEX SAYS (consult):
+════════════════════════════════════════════════════════════
+<完整输出，原样 — 包含 [codex thinking] 轨迹>
+════════════════════════════════════════════════════════════
+Tokens: N | Est. cost: ~$X.XX
+Session saved — run /codex again to continue this conversation.
+```
+
+7. 呈现后，注意 Codex 的分析与你自己的理解有任何分歧的地方。如果存在分歧，标记出来：
+   "注意：Claude Code 在 X 问题上有不同意见，原因是 Y。"
+
+---
+
+## 模型与推理
+
+**模型：** 不硬编码任何模型 — codex 使用其当前的默认模型（前沿
+代理式编码模型）。这意味着当 OpenAI 发布新模型时，/codex 会自动
+使用它们。如果用户想要特定模型，将 `-m` 传递给 codex。
+
+**推理努力（每个模式的默认值）：**
+- **审查（2A）：** `high` — 有界的 diff 输入，需要彻底性但不需要最大 token
+- **挑战（2B）：** `high` — 对抗性但受 diff 大小限制
+- **咨询（2C）：** `medium` — 大上下文（计划、代码库）、交互式、需要速度
+
+`xhigh` 使用的 token 比 `high` 多约 23 倍，并在大上下文任务上导致 50+ 分钟的挂起
+（OpenAI 问题 #8545、#8402、#6931）。用户可以使用 `--xhigh` 标志覆盖
+（例如，`/codex review --xhigh`），当他们想要最大推理能力并愿意等待时。
+
+**网络搜索：** 所有 codex 命令都使用 `--enable web_search_cached`，以便 Codex 在审查期间可以查找
+文档和 API。这是 OpenAI 的缓存索引 — 快速，无额外成本。
+
+如果用户指定了模型（例如，`/codex review -m gpt-5.1-codex-max`
+或 `/codex challenge -m gpt-5.2`），将 `-m` 标志传递给 codex。
+
+---
+
+## 成本估算
+
+从 stderr 解析 token 数量。Codex 将 `tokens used\nN` 打印到 stderr。
+
+显示为：`Tokens: N`
+
+如果 token 数量不可用，显示：`Tokens: unknown`
+
+---
+
+## 错误处理
+
+- **未找到二进制文件：** 在步骤 0 中检测。停止并提供安装说明。
+- **认证错误：** Codex 向 stderr 打印认证错误。暴露错误：
+  "Codex 认证失败。在终端中运行 `codex login` 以通过 ChatGPT 进行认证。"
+- **超时（Bash 外层门控）：** 如果 Bash 调用超时（审查/挑战 5 分钟，咨询 10 分钟），告诉用户：
+  "Codex 超时。提示可能太大或 API 可能较慢。重试或使用更小的范围。"
+- **超时（内部 `timeout` 包装器，退出码 124）：** 如果 shell `timeout 600` 包装器先触发，技能的挂起检测块会自动记录遥测事件 + 运营学习并打印："Codex stalled past 10 minutes. Common causes: model API stall, long prompt, network issue. Try re-running. If persistent, split the prompt or check ~/.codex/logs/."无需额外操作。
+- **空响应：** 如果 `$TMPRESP` 为空或不存在，告诉用户：
+  "Codex 未返回响应。检查 stderr 获取错误信息。"
+- **会话恢复失败：** 如果恢复失败，删除会话文件并重新开始。
+
+---
+
+## 重要规则
+
+- **永远不要修改文件。** 此技能是只读的。Codex 在只读沙盒模式下运行。
+- **原样呈现输出。** 在展示 Codex 的输出之前，不要截断、摘要或编辑。
+  在 CODEX SAYS 块中完整展示。
+- **先展示完整输出，再添加综合评论。** 任何 Claude 的评论都在完整输出之后。
+- **所有 Bash 调用对 codex 设置 5 分钟超时**（`timeout: 300000`）。
+- **不重复审查。** 如果用户已经运行了 `/review`，Codex 提供第二个
+  独立意见。不要重新运行 Claude Code 自己的审查。
+- **检测技能文件陷入死循环。** 收到 Codex 输出后，扫描 Codex 是否被技能文件分心的迹象：
+  `gstack-config`、`gstack-update-check`、`SKILL.md` 或 `skills/gstack`。
+  如果输出中出现这些内容，追加警告："Codex 似乎读取了 gstack 技能文件而不是审查你的代码。考虑重试。"
