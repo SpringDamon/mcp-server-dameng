@@ -19,7 +19,6 @@ function getConfig(): DamengConfig {
   const url = process.env.DAMENG_URL;
   const host = process.env.DAMENG_HOST;
   const port = process.env.DAMENG_PORT;
-  const dbName = process.env.DAMENG_DB;
   const schema = process.env.DAMENG_SCHEMA;
   const user = process.env.DAMENG_USER;
   const password = process.env.DAMENG_PASSWORD;
@@ -27,14 +26,13 @@ function getConfig(): DamengConfig {
   if (!user || !password) {
     throw new Error(
       "环境变量 DAMENG_USER 和 DAMENG_PASSWORD 必须设置\n" +
-      "同时需要设置 DAMENG_URL (完整 JDBC URL) 或 DAMENG_HOST + DAMENG_PORT + DAMENG_DB"
+      "同时需要设置 DAMENG_URL (完整 JDBC URL) 或 DAMENG_HOST + DAMENG_PORT"
     );
   }
 
   const finalUrl = url || buildConnectionString(
     host || "localhost",
-    port ? parseInt(port, 10) : 5236,
-    dbName || ""
+    port ? parseInt(port, 10) : 5236
   );
 
   return { url: finalUrl, user, password, schema };

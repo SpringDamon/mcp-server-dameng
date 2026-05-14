@@ -119,6 +119,6 @@ export async function testConnection(config: DamengConfig): Promise<QueryResult>
   return executeSql(config, "SELECT 1 AS TEST", 1);
 }
 
-export function buildConnectionString(host: string, port: number, dbName: string): string {
+export function buildConnectionString(host: string, port: number): string {
   return `jdbc:dm://${host}:${port}`;
 }

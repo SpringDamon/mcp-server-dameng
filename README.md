@@ -20,21 +20,21 @@
 
 ```bash
 # 首次运行会自动下载 npm 包
-npx -y mcp-server-dameng
+npx -y mcp-server-dameng@latest
 ```
 
 ### 方式二：全局安装
 
 ```bash
-npm install -g mcp-server-dameng
+npm install -g mcp-server-dameng@latest
 mcp-server-dameng
 ```
 
 ### 方式三：项目内安装
 
 ```bash
-npm install mcp-server-dameng
-npx mcp-server-dameng
+npm install mcp-server-dameng@latest
+npx mcp-server-dameng@latest
 ```
 
 ## 配置 JDBC 驱动
@@ -63,7 +63,7 @@ cp DmJdbcDriver18.jar node_modules/mcp-server-dameng/lib/
 ### 方式 C：运行 setup 命令获取帮助
 
 ```bash
-npx mcp-server-dameng setup
+npx mcp-server-dameng@latest setup
 ```
 
 ## 环境变量配置
@@ -72,7 +72,7 @@ npx mcp-server-dameng setup
 
 | 变量 | 说明 | 示例 |
 |------|------|------|
-| `DAMENG_URL` | 完整 JDBC 连接 URL | `jdbc:dm://localhost:5236?schema=DB_NAME` |
+| `DAMENG_URL` | 完整 JDBC 连接 URL | `jdbc:dm://localhost:5236` |
 | `DAMENG_USER` | 数据库用户名 | `your_username` |
 | `DAMENG_PASSWORD` | 数据库密码 | `your_password` |
 
@@ -82,12 +82,12 @@ npx mcp-server-dameng setup
 |------|------|--------|
 | `DAMENG_HOST` | 数据库主机地址 | `localhost` |
 | `DAMENG_PORT` | 数据库端口 | `5236` |
-| `DAMENG_DB` | 数据库模式名 | — |
 
 ### 可选
 
 | 变量 | 说明 |
 |------|------|
+| `DAMENG_SCHEMA` | 默认模式名（连接后自动设置） |
 | `DAMENG_DRIVER_PATH` | JDBC 驱动 JAR 文件路径 |
 
 ## 在 AI 工具中配置
@@ -103,7 +103,8 @@ npx mcp-server-dameng setup
       "command": "npx",
       "args": ["-y", "mcp-server-dameng@latest"],
       "env": {
-        "DAMENG_URL": "jdbc:dm://your-host:5236?schema=YOUR_SCHEMA",
+        "DAMENG_URL": "jdbc:dm://your-host:5236",
+        "DAMENG_SCHEMA": "YOUR_SCHEMA",
         "DAMENG_USER": "your_username",
         "DAMENG_PASSWORD": "your_password",
         "DAMENG_DRIVER_PATH": "D:\\path\\to\\DmJdbcDriver18.jar"

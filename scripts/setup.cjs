@@ -85,11 +85,11 @@ console.log("  DAMENG_PASSWORD 数据库密码");
 console.log("");
 console.log("可选环境变量:");
 console.log("  DAMENG_DRIVER_PATH   JDBC 驱动 JAR 文件路径（默认查找 lib/ 目录）");
+console.log("  DAMENG_SCHEMA        默认模式名（连接后自动设置）");
 console.log("");
 console.log("或者使用拆分方式（替代 DAMENG_URL）:");
 console.log("  DAMENG_HOST     数据库主机地址（默认 localhost）");
 console.log("  DAMENG_PORT     数据库端口（默认 5236）");
-console.log("  DAMENG_DB       数据库模式名");
 console.log("");
 
 // 5. MCP 配置示例
@@ -103,9 +103,10 @@ console.log(JSON.stringify({
       "command": "npx",
       "args": ["-y", "mcp-server-dameng"],
       "env": {
-        "DAMENG_URL": "jdbc:dm://your-host:5236?schema=YOUR_SCHEMA",
+        "DAMENG_URL": "jdbc:dm://your-host:5236",
         "DAMENG_USER": "your_username",
-        "DAMENG_PASSWORD": "your_password"
+        "DAMENG_PASSWORD": "your_password",
+        "DAMENG_SCHEMA": "YOUR_SCHEMA"
       }
     }
   }
