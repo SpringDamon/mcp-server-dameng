@@ -1,6 +1,6 @@
 {
   "name": "mcp-server-dameng",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "达梦数据库 MCP Server - 通过 Model Context Protocol 让 AI 助手直接连接和查询达梦 DM8 数据库",
   "keywords": [
     "mcp",
@@ -28,6 +28,7 @@
   "files": [
     "dist/",
     "java/",
+    "scripts/",
     "README.md",
     "LICENSE"
   ],
