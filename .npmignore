@@ -6,3 +6,4 @@ lib/
 node_modules/
 .git/
 .github/
+*.class
