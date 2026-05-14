@@ -4,6 +4,7 @@ lib/DmJdbcDriver18.jar
 *.log
 .DS_Store
 *.tgz
+*.class
 
 package-lock.json
 pnpm-lock.yaml
